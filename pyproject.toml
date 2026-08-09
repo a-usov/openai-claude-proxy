@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openai-claude-proxy"
+version = "0.1.0"
+description = "An Anthropic Messages to OpenAI-compatible API proxy for Claude Code"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.scripts]
+openai-claude-proxy = "openai_claude_proxy.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openai_claude_proxy"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not live'"
+markers = [
+  "live: opt-in tests that send synthetic requests to a configured provider",
+]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+  "anthropic==0.121.0",
+  "anyio>=4,<5",
+  "openai==2.53.0",
+  "pytest>=8,<9",
+  "ruff>=0.16.2",
+  "ty>=0.0.69",
+]
+
+[tool.uv]
+required-version = "==0.12.3"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812", # Ruff formatter owns trailing commas.
+  "CPY001", # The repository-level MIT license is authoritative.
+  "D203",   # Incompatible with D211.
+  "D213",   # Incompatible with D212.
+  "E501",   # Ruff formatter intentionally leaves some long lines.
+  "EM101",  # Protocol validation errors are clearer at their raise sites.
+  "EM102",  # Dynamic protocol validation errors need local context.
+  "TRY003", # Error text is part of the proxy's client-facing API.
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 40
+
+[tool.ruff.lint.pylint]
+max-branches = 30
+max-returns = 8
+max-statements = 120
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+  "D100",    # Test modules are named for the behavior they cover.
+  "D103",    # Test function names serve as their documentation.
+  "INP001",  # Tests are not an importable application package.
+  "PLR2004", # Literal wire values make fixtures easier to audit.
+  "S101",    # Pytest's assertion rewriting requires assert statements.
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ty.src]
+include = ["src", "tests"]

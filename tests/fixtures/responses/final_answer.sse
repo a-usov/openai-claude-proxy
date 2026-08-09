@@ -1,0 +1,13 @@
+data: {"type":"response.created","response":{"id":"resp_turn_2","model":"gpt-test","status":"in_progress"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_final","role":"assistant","status":"in_progress","content":[]}}
+
+data: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg_final","delta":"Read complete."}
+
+data: {"type":"response.output_text.done","output_index":0,"content_index":0,"item_id":"msg_final","text":"Read complete."}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_final","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Read complete.","annotations":[]}]}}
+
+data: {"type":"response.completed","response":{"id":"resp_turn_2","model":"gpt-test","status":"completed","output":[{"type":"message","id":"msg_final","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Read complete.","annotations":[]}]}],"usage":{"input_tokens":35,"output_tokens":4}}}
