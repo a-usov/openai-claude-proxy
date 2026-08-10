@@ -536,6 +536,49 @@ def test_anthropic_request_converts_to_typed_responses_items() -> None:
     ]
 
 
+def test_responses_preserves_system_cache_breakpoint_in_developer_input() -> None:
+    result = anthropic_to_responses(
+        {
+            "model": "claude-opus-4-6",
+            "system": [
+                {"type": "text", "text": "Billing metadata"},
+                {
+                    "type": "text",
+                    "text": "Stable system prompt",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": "Current instructions"},
+            ],
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+        Settings(model_override="gpt-test"),
+    )
+
+    assert "instructions" not in result
+    assert result["input"] == [
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [
+                {"type": "input_text", "text": "Billing metadata"},
+                {
+                    "type": "input_text",
+                    "text": "Stable system prompt",
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+                {"type": "input_text", "text": "Current instructions"},
+            ],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hello"}],
+        },
+    ]
+    assert result["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+
+
 def test_responses_result_maps_tools_model_and_cache_usage() -> None:
     reasoning_item = {"type": "reasoning", "id": "rs_1", "summary": []}
     result = responses_to_anthropic(

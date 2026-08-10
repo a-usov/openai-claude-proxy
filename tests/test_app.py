@@ -639,6 +639,92 @@ async def test_claude_code_helper_request_with_thinking_reaches_prefixed_upstrea
 
 
 @pytest.mark.anyio
+async def test_claude_code_cached_system_request_reaches_responses_upstream() -> None:
+    seen: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_claude_code",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_claude_code",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Ready.",
+                                "annotations": [],
+                            },
+                        ],
+                    },
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            },
+        )
+
+    app = create_app(
+        Settings(
+            upstream_base_url="https://gateway.example/v1/proxy",
+            openai_api="responses",
+            model_override="gpt-test",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        response = await client.post(
+            "/v1/messages?beta=true",
+            json={
+                "model": "claude-opus-4-6",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "system": [
+                    {"type": "text", "text": "Billing metadata"},
+                    {
+                        "type": "text",
+                        "text": "Stable system prompt",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ],
+                "max_tokens": 64000,
+                "thinking": {"type": "adaptive", "display": "omitted"},
+                "context_management": {
+                    "edits": [{"type": "clear_thinking_20251015", "keep": "all"}],
+                },
+                "output_config": {"effort": "high"},
+            },
+        )
+
+    assert response.status_code == 200
+    assert seen["url"] == "https://gateway.example/v1/proxy/responses"
+    assert seen["body"]["input"][0] == {
+        "type": "message",
+        "role": "developer",
+        "content": [
+            {"type": "input_text", "text": "Billing metadata"},
+            {
+                "type": "input_text",
+                "text": "Stable system prompt",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            },
+        ],
+    }
+    assert seen["body"]["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+
+
+@pytest.mark.anyio
 async def test_claude_code_hello_probe_is_handled_locally() -> None:
     upstream_called = False
 

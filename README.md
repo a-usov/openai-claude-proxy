@@ -350,11 +350,12 @@ There are unavoidable semantic differences between providers:
   content supports the same mapping. A top-level marker is first applied to the
   last cacheable Anthropic block. OpenAI currently exposes one request-wide `30m`
   lifetime, so Anthropic's per-marker `5m` and `1h` TTLs cannot be preserved
-  exactly. Responses `instructions`, function calls, and function-tool schemas do
-  not accept breakpoints in the reviewed OpenAI SDK; those locations are rejected
-  instead of silently moved. Reported cache reads and writes are mapped into
-  Anthropic usage fields. See OpenAI's
-  [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
+  exactly. Cache-marked Anthropic system arrays become Responses developer input
+  messages so their text-block breakpoints remain in the same prompt position.
+  Responses function calls and function-tool schemas do not accept breakpoints in
+  the reviewed OpenAI SDK; those locations are rejected instead of silently moved.
+  Reported cache reads and writes are mapped into Anthropic usage fields. See
+  OpenAI's [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
 - Anthropic adaptive and disabled `thinking` modes are accepted while explicit
   `output_config.effort` continues to control OpenAI reasoning effort. The
   `thinking.display` setting needs no OpenAI field because translated responses do

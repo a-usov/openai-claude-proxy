@@ -540,6 +540,20 @@ def _anthropic_to_responses(
         raise ConversionError("stop_sequences cannot be represented by the Responses API")
 
     input_items: list[dict[str, Any]] = []
+    system = payload.get("system")
+    system_has_cache_breakpoint = isinstance(system, list) and _has_cache_breakpoint(system)
+    if system_has_cache_breakpoint:
+        input_items.append(
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    translated
+                    for block in system
+                    if (translated := _responses_content(block, assistant=False)) is not None
+                ],
+            },
+        )
     for source_message in payload["messages"]:
         role = source_message["role"]
         raw_content = source_message["content"]
@@ -575,7 +589,7 @@ def _anthropic_to_responses(
                 "store": False,
             },
         )
-    if system := payload.get("system"):
+    if system and not system_has_cache_breakpoint:
         result["instructions"] = (
             system if isinstance(system, str) else "".join(block["text"] for block in system)
         )

@@ -221,7 +221,7 @@ def _validate_message(message: object, index: int, backend: Backend) -> None:
         _validate_block(block, block_path, role, backend)
 
 
-def _validate_system(value: object, backend: Backend) -> None:
+def _validate_system(value: object) -> None:
     if value is None or isinstance(value, str):
         return
     if not isinstance(value, list):
@@ -232,8 +232,6 @@ def _validate_system(value: object, backend: Backend) -> None:
             raise ConversionError(f"{path} must be a text block")
         _validate_text(block, path)
         _validate_cache_control(block.get("cache_control"), f"{path}.cache_control")
-        if backend == "responses" and block.get("cache_control") is not None:
-            raise ConversionError("Responses instructions do not support prompt-cache breakpoints")
 
 
 def _validate_output_config(payload: dict[str, Any]) -> None:
@@ -463,7 +461,7 @@ def prepare_anthropic_request(
         raise ConversionError(
             "Final assistant-prefill messages cannot be represented faithfully by OpenAI",
         )
-    _validate_system(payload.get("system"), backend)
+    _validate_system(payload.get("system"))
     _validate_output_config(payload)
     _validate_thinking(payload.get("thinking"), max_tokens)
     _validate_context_management(payload.get("context_management"))
@@ -496,7 +494,7 @@ def prepare_anthropic_request(
     if _count_cache_controls(prepared) > MAX_PROMPT_CACHE_BREAKPOINTS:
         raise ConversionError("OpenAI supports at most four explicit prompt-cache breakpoints")
     # Validate the location selected by top-level cache control as well.
-    _validate_system(prepared.get("system"), backend)
+    _validate_system(prepared.get("system"))
     _validate_tools(prepared.get("tools"), backend)
     for index, message in enumerate(prepared["messages"]):
         _validate_message(message, index, backend)
