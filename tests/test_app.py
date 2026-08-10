@@ -1036,6 +1036,163 @@ async def test_anthropic_upstream_is_passthrough() -> None:
 
 
 @pytest.mark.anyio
+async def test_auto_protocol_routes_mapped_claude_and_non_claude_models() -> None:
+    seen_protocols: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path == "/v1/proxy/v1/messages":
+            seen_protocols.append("anthropic")
+            assert body["model"] == "gateway-claude-opus"
+            assert body["future_anthropic_field"] == {"enabled": True}
+            assert dict(request.url.params) == {"beta": "true", "tenant": "example"}
+            assert request.headers["anthropic-version"] == "2023-06-01"
+            assert request.headers["anthropic-beta"] == "future-beta"
+            assert "openai-organization" not in request.headers
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_auto_anthropic",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "gateway-claude-opus",
+                    "content": [{"type": "text", "text": "Anthropic route"}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                },
+            )
+
+        assert request.url.path == "/v1/proxy/v1/responses"
+        seen_protocols.append("openai")
+        assert body["model"] == "gateway-gpt-reasoning"
+        assert dict(request.url.params) == {"tenant": "example"}
+        assert request.headers["openai-organization"] == "org_example"
+        assert "anthropic-version" not in request.headers
+        assert "anthropic-beta" not in request.headers
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_auto_openai",
+                "model": "gateway-gpt-reasoning",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "OpenAI route"}],
+                    },
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            },
+        )
+
+    app = create_app(
+        Settings(
+            upstream_base_url="https://gateway.example/v1/proxy",
+            upstream_protocol="auto",
+            openai_api="responses",
+            upstream_messages_path="/v1/messages",
+            upstream_responses_path="/v1/responses",
+            upstream_query={"tenant": "example"},
+            auth_mode="bearer",
+            model_map={
+                "claude-opus-*": "gateway-claude-opus",
+                "claude-sonnet-*": "gateway-gpt-reasoning",
+            },
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    headers = {
+        "x-api-key": "helper-secret",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "future-beta",
+        "openai-organization": "org_example",
+    }
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        anthropic = await client.post(
+            "/v1/messages?beta=true",
+            headers=headers,
+            json={
+                "model": "claude-opus-5",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "future_anthropic_field": {"enabled": True},
+            },
+        )
+        translated = await client.post(
+            "/v1/messages?beta=true",
+            headers=headers,
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+    assert anthropic.status_code == translated.status_code == 200
+    assert anthropic.json()["content"] == [{"type": "text", "text": "Anthropic route"}]
+    assert translated.json()["content"][1] == {"type": "text", "text": "OpenAI route"}
+    assert seen_protocols == ["anthropic", "openai"]
+
+
+@pytest.mark.anyio
+async def test_auto_protocol_streams_mapped_anthropic_models_without_translation() -> None:
+    upstream_response: httpx.Response | None = None
+    sse = (
+        b'event: message_start\ndata: {"type":"message_start","message":{"model":"team-claude"}}\n\n'
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_response
+        assert request.url.path == "/v1/messages"
+        assert json.loads(request.content)["model"] == "team-claude"
+        upstream_response = httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=sse,
+        )
+        return upstream_response
+
+    app = create_app(
+        Settings(
+            upstream_base_url="https://gateway.example",
+            upstream_protocol="auto",
+            upstream_messages_path="/v1/messages",
+            model_map={"claude-opus-*": "team-claude"},
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-opus-5",
+                "max_tokens": 32,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.content == sse
+    assert upstream_response is not None
+    assert upstream_response.is_closed
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("openai_api", ["chat_completions", "responses"])
 async def test_malformed_anthropic_requests_return_400_before_upstream(openai_api: str) -> None:
     async def unexpected_handler(_request: httpx.Request) -> httpx.Response:
@@ -1456,6 +1613,80 @@ async def test_responses_token_count_uses_exact_upstream_endpoint() -> None:
             ],
         },
     }
+
+
+@pytest.mark.anyio
+async def test_auto_protocol_routes_token_counts_by_mapped_model() -> None:
+    seen_protocols: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path == "/v1/proxy/v1/messages/count_tokens":
+            seen_protocols.append("anthropic")
+            assert body["model"] == "gateway-claude-opus"
+            assert body["future_anthropic_field"] is True
+            assert dict(request.url.params) == {"beta": "true"}
+            return httpx.Response(200, json={"input_tokens": 31})
+
+        assert request.url.path == "/v1/proxy/v1/responses/input_tokens"
+        seen_protocols.append("openai")
+        assert body == {
+            "model": "gateway-gpt-reasoning",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello"}],
+                },
+            ],
+        }
+        assert not request.url.query
+        return httpx.Response(
+            200,
+            json={"object": "response.input_tokens", "input_tokens": 29},
+        )
+
+    app = create_app(
+        Settings(
+            upstream_base_url="https://gateway.example/v1/proxy",
+            upstream_protocol="auto",
+            openai_api="responses",
+            upstream_messages_path="/v1/messages",
+            upstream_responses_input_tokens_path="/v1/responses/input_tokens",
+            model_map={
+                "claude-opus-*": "gateway-claude-opus",
+                "claude-sonnet-*": "gateway-gpt-reasoning",
+            },
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        anthropic = await client.post(
+            "/v1/messages/count_tokens?beta=true",
+            json={
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "future_anthropic_field": True,
+            },
+        )
+        translated = await client.post(
+            "/v1/messages/count_tokens?beta=true",
+            json={
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+    assert anthropic.status_code == translated.status_code == 200
+    assert anthropic.json() == {"input_tokens": 31}
+    assert translated.json() == {"input_tokens": 29}
+    assert seen_protocols == ["anthropic", "openai"]
 
 
 @pytest.mark.anyio

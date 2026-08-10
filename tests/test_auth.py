@@ -104,6 +104,25 @@ def test_provider_header_policies_are_separate_and_hop_by_hop_headers_are_stripp
         assert "cookie" not in result
 
 
+def test_auto_protocol_uses_the_selected_route_header_policy() -> None:
+    incoming = {
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "future-beta",
+        "openai-organization": "org_work",
+    }
+    settings = Settings(upstream_protocol="auto")
+
+    anthropic = upstream_headers(incoming, settings, protocol="anthropic")
+    openai = upstream_headers(incoming, settings, protocol="openai")
+
+    assert anthropic["anthropic-version"] == "2023-06-01"
+    assert anthropic["anthropic-beta"] == "future-beta"
+    assert "openai-organization" not in anthropic
+    assert openai["openai-organization"] == "org_work"
+    assert "anthropic-version" not in openai
+    assert "anthropic-beta" not in openai
+
+
 def test_anthropic_mandatory_headers_cannot_be_removed_and_openai_opt_in_is_explicit() -> None:
     incoming = {
         "anthropic-version": "2023-06-01",

@@ -49,6 +49,7 @@ def upstream_headers(
     settings: Settings,
     *,
     json_body: bool = True,
+    protocol: str | None = None,
 ) -> dict[str, str]:
     """Build a small, explicit upstream header set and apply auth rewriting."""
     headers = {"accept": incoming.get("accept", "application/json")}
@@ -57,7 +58,10 @@ def upstream_headers(
     elif content_type := incoming.get("content-type"):
         headers["content-type"] = content_type
     forward_names = set(settings.forward_headers)
-    if settings.upstream_protocol == "anthropic":
+    selected_protocol = protocol or settings.upstream_protocol
+    if selected_protocol == "auto":
+        selected_protocol = "openai"
+    if selected_protocol == "anthropic":
         forward_names.update(settings.anthropic_forward_headers)
         forward_names.update(
             name for name in incoming if name.startswith(("anthropic-", "x-claude-code-"))

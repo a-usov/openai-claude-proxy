@@ -4,7 +4,8 @@ A small Python proxy that lets Claude Code use an OpenAI-compatible service. It
 accepts Anthropic Messages API requests and translates messages, images, tools,
 tool results, structured outputs, reasoning effort, errors, token usage, and SSE
 streams to either OpenAI Chat Completions or Responses. It can also transparently
-proxy Anthropic APIs and other OpenAI-compatible routes.
+proxy Anthropic APIs, choose between Anthropic and OpenAI per mapped model, and
+forward other OpenAI-compatible routes.
 
 This is intended for internal gateways and Azure/Microsoft Foundry deployments as
 well as the public OpenAI or Anthropic APIs. It uses raw HTTP rather than a
@@ -116,7 +117,7 @@ All configuration is via environment variables.
 | --- | --- | --- |
 | `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | Fixed upstream base URL |
 | `UPSTREAM_MODELS_BASE_URL` | unset | Optional fixed base URL for a separately hosted model catalog |
-| `UPSTREAM_PROTOCOL` | `openai` | `openai` translates Messages; `anthropic` passes them through |
+| `UPSTREAM_PROTOCOL` | `openai` | `openai` translates Messages, `anthropic` passes through, `auto` selects per mapped model |
 | `OPENAI_API` | `chat_completions` | Translation backend: `chat_completions` or `responses` |
 | `UPSTREAM_CHAT_PATH` | `/chat/completions` | OpenAI Chat Completions path relative to the base |
 | `UPSTREAM_RESPONSES_PATH` | `/responses` | OpenAI Responses path relative to the base |
@@ -133,6 +134,7 @@ All configuration is via environment variables.
 | `MODEL_DISCOVERY_MODE` | `passthrough` | `auto` converts an upstream OpenAI model list into Claude aliases |
 | `MODEL_DISCOVERY_INCLUDE` | `*` | Comma-separated upstream model-ID globs included by automatic discovery |
 | `MODEL_DISCOVERY_EXCLUDE` | unset | Comma-separated upstream model-ID globs excluded by automatic discovery |
+| `ANTHROPIC_MODEL_PATTERNS` | `*claude*,*anthropic*` | Case-insensitive model globs routed to Anthropic Messages when protocol is `auto` |
 | `MAX_TOKENS_FIELD` | `max_tokens` | Use `max_completion_tokens` for upstreams that require the newer name |
 | `MIN_OUTPUT_TOKENS` | `1` | Raise smaller client output limits to an explicit upstream minimum |
 | `REASONING_EFFORT_ENABLED` | `true` | Translate Claude request effort into OpenAI reasoning effort |
@@ -170,6 +172,46 @@ export MODEL_MAP='{
 With neither setting, the client-selected model passes through unchanged.
 `MODEL_OVERRIDE` takes precedence over `MODEL_MAP`; the legacy `DEFAULT_MODEL`
 environment name remains an alias. Exact map keys take precedence over glob patterns.
+
+### Automatic upstream protocol routing
+
+Gateways that serve both Anthropic and OpenAI-compatible models can select a wire
+protocol per request:
+
+```bash
+export UPSTREAM_PROTOCOL=auto
+export OPENAI_API=responses
+export UPSTREAM_MESSAGES_PATH=/v1/messages
+export UPSTREAM_RESPONSES_PATH=/v1/responses
+export UPSTREAM_RESPONSES_INPUT_TOKENS_PATH=/v1/responses/input_tokens
+export MODEL_MAP='{
+  "claude-opus-*": "gateway-claude-opus",
+  "claude-sonnet-*": "gateway-gpt-reasoning"
+}'
+```
+
+The proxy first resolves `MODEL_OVERRIDE`, exact/glob `MODEL_MAP`, and automatic
+discovery aliases. It then compares that mapped upstream ID against the
+case-insensitive `ANTHROPIC_MODEL_PATTERNS` globs. A match uses Anthropic Messages;
+everything else uses the OpenAI adapter selected by `OPENAI_API`. This order is
+important: every incoming Claude Code picker alias begins with `claude`, but an
+alias mapped to a GPT, Kimi, or Gemini deployment must still use OpenAI translation.
+
+The default patterns match model IDs containing `claude` or `anthropic`. Override
+them for opaque deployment names, for example:
+
+```bash
+export ANTHROPIC_MODEL_PATTERNS='team-opus-*,team-sonnet-*'
+```
+
+On an automatically selected Anthropic route, the proxy changes only the request's
+`model` to its mapped ID and otherwise preserves Anthropic JSON fields, provider
+headers, query parameters, response bodies, statuses, and SSE events. Token-count
+calls use the matching Anthropic `/messages/count_tokens` or OpenAI
+`/responses/input_tokens` path. `TOKEN_COUNT_MODE` governs only selected OpenAI
+routes. Fixed `openai` and `anthropic` modes retain their existing behavior. Auto
+selection applies only to the explicit Messages and count-token routes; generic
+pass-through routes retain the OpenAI header policy.
 
 ### Model and reasoning mapping
 

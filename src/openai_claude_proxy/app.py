@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .auth import CredentialError, upstream_headers
-from .backends import select_openai_backend
+from .backends import select_messages_backend, select_openai_backend
 from .config import Settings
 from .conversion import (
     ConversionError,
@@ -35,6 +36,15 @@ UNSUPPORTED_TOKEN_COUNT_STATUSES = frozenset({404, 405, 501})
 
 class RequestBodyTooLargeError(ValueError):
     """Signal that a client body exceeded the configured deployment limit."""
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAITokenCountInput:
+    """Keep one validated OpenAI token-count request together."""
+
+    payload: dict[str, Any]
+    body: dict[str, Any]
+    backend: OpenAIBackend
 
 
 def _error(
@@ -144,10 +154,16 @@ def _token_count_fallback(
     )
 
 
+def _fixed_openai_token_count_disabled(settings: Settings) -> bool:
+    return (
+        settings.upstream_protocol == "openai" and settings.token_count_mode == "unsupported"  # noqa: S105
+    )
+
+
 async def _count_openai_tokens(
     request: Request,
+    converted: OpenAITokenCountInput,
     settings: Settings,
-    backend: OpenAIBackend,
     send_json: Callable[[Request, str, dict[str, Any]], Awaitable[httpx.Response]],
     upstream_error: Callable[[httpx.Response], Awaitable[JSONResponse]],
 ) -> Response:
@@ -156,28 +172,23 @@ async def _count_openai_tokens(
             "Token counting is not supported by this OpenAI-compatible upstream",
             501,
         )
-    try:
-        payload = await _read_json(request, settings.max_request_body_bytes)
-        count_body = backend.convert_token_count_request(payload, settings)
-    except ConversionError as exc:
-        return _error(str(exc))
     if settings.token_count_mode == "estimate":  # noqa: S105
-        return JSONResponse({"input_tokens": estimate_anthropic_tokens(payload)})
-    if backend.token_count_path is None:
+        return JSONResponse({"input_tokens": estimate_anthropic_tokens(converted.payload)})
+    if converted.backend.token_count_path is None:
         return _token_count_fallback(
             settings,
-            payload,
+            converted.payload,
             exact=settings.token_count_mode == "exact",  # noqa: S105
         )
 
-    upstream = await send_json(request, backend.token_count_path, count_body)
+    upstream = await send_json(request, converted.backend.token_count_path, converted.body)
     if upstream.status_code >= HTTP_CLIENT_ERROR:
         if (
             settings.token_count_mode == "auto"  # noqa: S105
             and upstream.status_code in UNSUPPORTED_TOKEN_COUNT_STATUSES
         ):
             await upstream.aclose()
-            return _token_count_fallback(settings, payload, exact=False)
+            return _token_count_fallback(settings, converted.payload, exact=False)
         return await upstream_error(upstream)
     try:
         raw = _require_response_body(
@@ -354,10 +365,31 @@ def create_app(
         if configured.upstream_protocol == "anthropic":
             count_path = configured.upstream_messages_path.rstrip("/") + "/count_tokens"
             return await forward_json(request, count_path)
+        if _fixed_openai_token_count_disabled(configured):
+            return _error(
+                "Token counting is not supported by this OpenAI-compatible upstream",
+                501,
+            )
+        try:
+            payload = await _read_json(request, configured.max_request_body_bytes)
+            selected = select_messages_backend(configured, payload.get("model"), openai_backend)
+            count_body = selected.convert_token_count_request(payload, configured)
+        except ConversionError as exc:
+            return _error(str(exc))
+        if not selected.translates_openai:
+            upstream = await send_json(
+                request,
+                cast("str", selected.token_count_path),
+                count_body,
+                protocol=selected.protocol,
+                forward_client_query=True,
+            )
+            return await forward_upstream(upstream)
+        selected_openai = cast("OpenAIBackend", selected.openai)
         return await _count_openai_tokens(
             request,
+            OpenAITokenCountInput(payload, count_body, selected_openai),
             configured,
-            openai_backend,
             send_json,
             upstream_error,
         )
@@ -368,20 +400,34 @@ def create_app(
             return await forward_json(request, configured.upstream_messages_path)
         try:
             anthropic_body = await _read_json(request, configured.max_request_body_bytes)
-            openai_body = openai_backend.convert_request(anthropic_body, configured)
+            selected = select_messages_backend(
+                configured,
+                anthropic_body.get("model"),
+                openai_backend,
+            )
+            upstream_body = selected.convert_request(anthropic_body, configured)
         except ConversionError as exc:
             return _error(str(exc))
 
-        upstream = await send_json(request, openai_backend.path, openai_body)
+        upstream = await send_json(
+            request,
+            selected.path,
+            upstream_body,
+            protocol=selected.protocol,
+            forward_client_query=not selected.translates_openai,
+        )
+        if not selected.translates_openai:
+            return await forward_upstream(upstream)
+        selected_openai = cast("OpenAIBackend", selected.openai)
         if upstream.status_code >= HTTP_CLIENT_ERROR:
             return await upstream_error(upstream)
         upstream_content_type = upstream.headers.get("content-type", "").lower()
-        if openai_body.get("stream") and upstream_content_type.startswith("text/event-stream"):
-            stream = openai_backend.convert_stream(
+        if upstream_body.get("stream") and upstream_content_type.startswith("text/event-stream"):
+            stream = selected_openai.convert_stream(
                 upstream,
                 str(anthropic_body.get("model", "")),
                 configured.stream_ping_interval,
-                openai_body,
+                upstream_body,
             )
             return StreamingResponse(
                 stream,
@@ -398,17 +444,17 @@ def create_app(
                 "Upstream response exceeded the response size limit",
             )
             decoded = json.loads(raw)
-            converted = openai_backend.convert_response(
+            converted = selected_openai.convert_response(
                 decoded,
                 str(anthropic_body["model"]),
-                openai_body,
+                upstream_body,
             )
         except (json.JSONDecodeError, ConversionError, TypeError, AttributeError, KeyError) as exc:
             await upstream.aclose()
             return _error(f"Invalid response from upstream: {exc}", 502, "api_error")
         headers = _response_headers(upstream)
         await upstream.aclose()
-        if openai_body.get("stream"):
+        if upstream_body.get("stream"):
             return StreamingResponse(
                 anthropic_message_stream(converted),
                 media_type="text/event-stream",
@@ -420,13 +466,35 @@ def create_app(
             )
         return JSONResponse(converted, headers=headers)
 
-    async def send_json(request: Request, path: str, body: dict[str, Any]) -> httpx.Response:
-        headers = upstream_headers(request.headers, configured)
+    def forwarded_query(
+        request: Request,
+        *,
+        include_client: bool,
+    ) -> dict[str, str] | list[tuple[str, str]]:
+        if not include_client:
+            return configured.upstream_query
+        values = [
+            (name, value)
+            for name, value in request.query_params.multi_items()
+            if name not in configured.upstream_query
+        ]
+        values.extend(configured.upstream_query.items())
+        return values
+
+    async def send_json(
+        request: Request,
+        path: str,
+        body: dict[str, Any],
+        *,
+        protocol: str = "openai",
+        forward_client_query: bool = False,
+    ) -> httpx.Response:
+        headers = upstream_headers(request.headers, configured, protocol=protocol)
         outbound = request.app.state.client.build_request(
             "POST",
             configured.upstream_url(path),
             headers=headers,
-            params=configured.upstream_query,
+            params=forwarded_query(request, include_client=forward_client_query),
             json=body,
         )
         try:
@@ -435,6 +503,31 @@ def create_app(
             raise UpstreamError("Upstream request timed out", 504) from exc
         except httpx.HTTPError as exc:
             raise UpstreamError("Could not reach upstream", 502) from exc
+
+    async def forward_upstream(upstream: httpx.Response) -> Response:
+        headers_out = _response_headers(upstream)
+        content_type = upstream.headers.get("content-type", "application/json")
+        if content_type.startswith("text/event-stream"):
+            return StreamingResponse(
+                passthrough_stream(upstream),
+                status_code=upstream.status_code,
+                headers={
+                    **headers_out,
+                    "cache-control": "no-cache",
+                    "content-type": content_type,
+                    "x-accel-buffering": "no",
+                },
+            )
+        content = await _read_response_body(upstream, configured.max_response_body_bytes)
+        if content is None:
+            await upstream.aclose()
+            return _error("Upstream response exceeded the response size limit", 502, "api_error")
+        await upstream.aclose()
+        return Response(
+            content,
+            status_code=upstream.status_code,
+            headers={**headers_out, "content-type": content_type},
+        )
 
     async def upstream_error(upstream: httpx.Response) -> JSONResponse:
         raw = await _read_response_body(upstream, configured.max_error_body_bytes)
@@ -476,12 +569,6 @@ def create_app(
     ) -> Response:
         body = await _read_request_body(request, configured.max_request_body_bytes)
         headers = upstream_headers(request.headers, configured, json_body=False)
-        forwarded_query = [
-            (name, value)
-            for name, value in request.query_params.multi_items()
-            if name not in configured.upstream_query
-        ]
-        forwarded_query.extend(configured.upstream_query.items())
         outbound = request.app.state.client.build_request(
             request.method,
             (
@@ -490,7 +577,7 @@ def create_app(
                 else configured.upstream_url(path)
             ),
             headers=headers,
-            params=forwarded_query,
+            params=forwarded_query(request, include_client=True),
             content=body,
         )
         try:
@@ -499,29 +586,7 @@ def create_app(
             return _error("Upstream request timed out", 504)
         except httpx.HTTPError:
             return _error("Could not reach upstream", 502)
-        headers_out = _response_headers(upstream)
-        content_type = upstream.headers.get("content-type", "application/json")
-        if content_type.startswith("text/event-stream"):
-            return StreamingResponse(
-                passthrough_stream(upstream),
-                status_code=upstream.status_code,
-                headers={
-                    **headers_out,
-                    "cache-control": "no-cache",
-                    "content-type": content_type,
-                    "x-accel-buffering": "no",
-                },
-            )
-        content = await _read_response_body(upstream, configured.max_response_body_bytes)
-        if content is None:
-            await upstream.aclose()
-            return _error("Upstream response exceeded the response size limit", 502, "api_error")
-        await upstream.aclose()
-        return Response(
-            content,
-            status_code=upstream.status_code,
-            headers={**headers_out, "content-type": content_type},
-        )
+        return await forward_upstream(upstream)
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def passthrough(request: Request, path: str) -> Response:

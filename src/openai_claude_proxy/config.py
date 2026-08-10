@@ -143,6 +143,7 @@ class Settings:
     model_discovery_mode: str = "passthrough"
     model_discovery_include: tuple[str, ...] = ("*",)
     model_discovery_exclude: tuple[str, ...] = ()
+    anthropic_model_patterns: tuple[str, ...] = ("*claude*", "*anthropic*")
     model_override: str | None = None
     max_tokens_field: str = "max_tokens"
     min_output_tokens: int = 1
@@ -172,6 +173,9 @@ class Settings:
         self.upstream_protocol = self.upstream_protocol.lower()
         self.openai_api = self.openai_api.lower()
         self.model_discovery_mode = self.model_discovery_mode.lower()
+        self.anthropic_model_patterns = tuple(
+            pattern.lower() for pattern in self.anthropic_model_patterns
+        )
         self.auth_mode = self.auth_mode.lower()
         self.upstream_api_key_header = self.upstream_api_key_header.lower()
         self.passthrough_strip_prefix = self.passthrough_strip_prefix.rstrip("/")
@@ -181,16 +185,25 @@ class Settings:
             name.lower() for name in self.anthropic_forward_headers
         )
 
-        if self.upstream_protocol not in {"openai", "anthropic"}:
-            raise ConfigError("UPSTREAM_PROTOCOL must be 'openai' or 'anthropic'")
+        if self.upstream_protocol not in {"openai", "anthropic", "auto"}:
+            raise ConfigError("UPSTREAM_PROTOCOL must be 'openai', 'anthropic', or 'auto'")
         if self.openai_api not in {"chat_completions", "responses"}:
             raise ConfigError("OPENAI_API must be 'chat_completions' or 'responses'")
         if self.model_discovery_mode not in {"auto", "passthrough"}:
             raise ConfigError("MODEL_DISCOVERY_MODE must be 'auto' or 'passthrough'")
-        if self.model_discovery_mode == "auto" and self.upstream_protocol != "openai":
-            raise ConfigError("MODEL_DISCOVERY_MODE=auto requires UPSTREAM_PROTOCOL=openai")
+        if self.model_discovery_mode == "auto" and self.upstream_protocol not in {
+            "openai",
+            "auto",
+        }:
+            raise ConfigError(
+                "MODEL_DISCOVERY_MODE=auto requires UPSTREAM_PROTOCOL=openai or auto",
+            )
         if not self.model_discovery_include:
             raise ConfigError("MODEL_DISCOVERY_INCLUDE must contain at least one pattern")
+        if self.upstream_protocol == "auto" and not self.anthropic_model_patterns:
+            raise ConfigError(
+                "ANTHROPIC_MODEL_PATTERNS must contain at least one pattern in auto mode",
+            )
         if self.auth_mode not in {
             "passthrough",
             "bearer",
@@ -350,6 +363,10 @@ class Settings:
             model_discovery_exclude=_patterns(
                 env.get("MODEL_DISCOVERY_EXCLUDE"),
                 defaults.model_discovery_exclude,
+            ),
+            anthropic_model_patterns=_patterns(
+                env.get("ANTHROPIC_MODEL_PATTERNS"),
+                defaults.anthropic_model_patterns,
             ),
             model_override=env.get("MODEL_OVERRIDE") or env.get("DEFAULT_MODEL"),
             max_tokens_field=env.get("MAX_TOKENS_FIELD", defaults.max_tokens_field),
