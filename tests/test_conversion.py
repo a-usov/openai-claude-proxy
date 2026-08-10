@@ -23,6 +23,7 @@ from openai_claude_proxy.models import automatic_model_alias
 from openai_claude_proxy.reasoning_state import (
     decode_responses_output,
     decode_responses_reasoning,
+    encode_responses_reasoning,
 )
 
 
@@ -1046,6 +1047,100 @@ def test_responses_complete_output_state_rejects_visible_content_changes() -> No
             },
             Settings(),
         )
+
+
+def test_responses_complete_output_state_allows_prompt_cache_metadata() -> None:
+    output = [
+        {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {"type": "output_text", "text": "Original", "annotations": []},
+            ],
+        },
+    ]
+    translated = responses_to_anthropic(
+        {"id": "resp_1", "status": "completed", "output": output},
+        "claude-test",
+        {"model": "claude-test"},
+    )
+    translated["content"][1]["cache_control"] = {"type": "ephemeral"}
+
+    request = anthropic_to_responses(
+        {
+            "model": "claude-test",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": translated["content"]},
+                {"role": "user", "content": "Continue"},
+            ],
+        },
+        Settings(),
+    )
+
+    assert request["input"][:-1] == output
+
+
+def test_responses_complete_output_state_allows_stream_reasoning_metadata_difference() -> None:
+    terminal_reasoning = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "encrypted_content": "opaque-reasoning-state",
+        "status": "completed",
+    }
+    streamed_reasoning = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "encrypted_content": "opaque-reasoning-state",
+    }
+    output = [
+        terminal_reasoning,
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "read",
+            "arguments": '{"path":"README.md"}',
+        },
+    ]
+    translated = responses_to_anthropic(
+        {"id": "resp_1", "status": "completed", "output": output},
+        "claude-test",
+        {"model": "gpt-test"},
+    )
+    reasoning_block = next(
+        block
+        for block in translated["content"]
+        if decode_responses_reasoning(block.get("data")) is not None
+    )
+    reasoning_block["data"] = encode_responses_reasoning(streamed_reasoning)
+
+    request = anthropic_to_responses(
+        {
+            "model": "claude-test",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "assistant", "content": translated["content"]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "README contents",
+                        },
+                    ],
+                },
+            ],
+        },
+        Settings(model_map={"claude-test": "gpt-test"}),
+    )
+
+    assert request["input"][:-1] == output
 
 
 def test_responses_rejects_stop_sequences_instead_of_dropping_them() -> None:

@@ -385,7 +385,9 @@ def _responses_assistant_items(
                 "Assistant message contains multiple proxy Responses output states"
             )
         output_items = complete_output[0]
-        if visible_blocks != _responses_visible_blocks(output_items):
+        if _responses_replay_content(visible_blocks) != _responses_replay_content(
+            _responses_visible_blocks(output_items),
+        ):
             raise ConversionError(
                 "Proxy Responses output state does not match the assistant content",
             )
@@ -428,6 +430,45 @@ def _responses_assistant_items(
             content.append(translated)
     flush_content()
     return items
+
+
+def _responses_replay_content(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the user-visible semantics protected by a complete output carrier."""
+    content: list[dict[str, Any]] = []
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text", "")
+            if content and content[-1]["type"] == "text":
+                content[-1]["text"] += text
+            else:
+                content.append({"type": "text", "text": text})
+            continue
+        if block_type == "tool_use":
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": block.get("id", ""),
+                    "name": block.get("name", ""),
+                    "input": block.get("input", {}),
+                },
+            )
+            continue
+        if block_type == "redacted_thinking":
+            try:
+                reasoning_item = decode_responses_reasoning(block.get("data"))
+            except ValueError as exc:
+                raise ConversionError(str(exc)) from exc
+            if reasoning_item is not None:
+                # The complete, model-bound output carrier is authoritative. A
+                # stream may expose a different metadata projection of the same
+                # opaque reasoning item in response.output_item.done.
+                continue
+            raise ConversionError(
+                "Only proxy-owned Responses reasoning state can be replayed upstream",
+            )
+        raise ConversionError(f"Unsupported Anthropic content block: {block_type!r}")
+    return content
 
 
 def _responses_visible_blocks(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

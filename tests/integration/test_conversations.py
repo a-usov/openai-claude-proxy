@@ -178,6 +178,26 @@ def _validate_reasoning_follow_up(request: httpx.Request, body: dict[str, Any]) 
         raise AssertionError(msg)
 
 
+def _validate_projected_reasoning_follow_up(
+    request: httpx.Request,
+    body: dict[str, Any],
+) -> None:
+    _assert_session_header(request)
+    assert [item["type"] for item in body["input"]] == [
+        "message",
+        "reasoning",
+        "function_call",
+        "function_call_output",
+    ]
+    assert body["input"][1] == {
+        "type": "reasoning",
+        "id": "rs_projection",
+        "summary": [],
+        "encrypted_content": "opaque-reasoning-state",
+        "status": "completed",
+    }
+
+
 def _validate_parallel_reasoning_follow_up(
     request: httpx.Request,
     body: dict[str, Any],
@@ -574,6 +594,57 @@ async def test_responses_reasoning_state_survives_a_proxy_restart() -> None:
 
     assert final.message["stop_reason"] == "end_turn"
     second_scenario.assert_complete()
+
+
+@pytest.mark.anyio
+async def test_responses_replays_terminal_reasoning_when_stream_metadata_differs() -> None:
+    scenario = ScenarioTransport(
+        [
+            ExpectedRequest(
+                method="POST",
+                path="/v1/responses",
+                validate=_validate_responses_initial,
+                response_body=_fixture(
+                    "responses/reasoning_tool_call_metadata_projection.sse",
+                ),
+            ),
+            ExpectedRequest(
+                method="POST",
+                path="/v1/responses",
+                validate=_validate_projected_reasoning_follow_up,
+                response_body=_fixture("responses/final_answer.sse"),
+            ),
+        ],
+    )
+    app = create_app(
+        Settings(
+            openai_api="responses",
+            model_map={"claude-test": "gpt-test"},
+        ),
+        transport=scenario,
+    )
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        conversation = AnthropicConversation(
+            client,
+            model="claude-test",
+            tools=TOOLS,
+            headers={"x-claude-code-session-id": "session-integration"},
+        )
+        first = await conversation.ask("Read the README")
+        assert first.message["stop_reason"] == "tool_use"
+        final = await conversation.submit_tool_results(
+            {"call_read": "README contents"},
+        )
+
+    assert final.message["stop_reason"] == "end_turn"
+    scenario.assert_complete()
 
 
 @pytest.mark.anyio
