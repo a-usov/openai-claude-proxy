@@ -573,6 +573,101 @@ async def test_model_discovery_rewrites_x_api_key_helper_credential() -> None:
 
 
 @pytest.mark.anyio
+async def test_claude_code_helper_request_with_thinking_reaches_prefixed_upstream() -> None:
+    seen: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_title",
+                "model": "gpt-test",
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": '{"title":"Test"}'},
+                        "finish_reason": "stop",
+                    },
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+            },
+        )
+
+    app = create_app(
+        Settings(
+            upstream_base_url="https://gateway.example/v1/proxy",
+            model_override="gpt-test",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        response = await client.post(
+            "/v1/messages?beta=true",
+            json={
+                "model": "claude-opus-4-6",
+                "messages": [{"role": "user", "content": "Create a title"}],
+                "system": [{"type": "text", "text": "Return a JSON title"}],
+                "max_tokens": 64000,
+                "thinking": {"type": "disabled"},
+                "temperature": 1,
+                "output_config": {
+                    "effort": "high",
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}},
+                            "required": ["title"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert seen["url"] == "https://gateway.example/v1/proxy/chat/completions"
+    assert seen["body"]["reasoning_effort"] == "high"
+    assert "thinking" not in seen["body"]
+
+
+@pytest.mark.anyio
+async def test_claude_code_hello_probe_is_handled_locally() -> None:
+    upstream_called = False
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_called
+        upstream_called = True
+        return httpx.Response(500)
+
+    app = create_app(Settings(), transport=httpx.MockTransport(handler))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        head_response = await client.head("/api/hello")
+        get_response = await client.get("/api/hello")
+
+    assert head_response.status_code == 200
+    assert head_response.headers["content-type"] == "application/json"
+    assert head_response.headers["content-length"] == "20"
+    assert head_response.content == b""
+    assert get_response.status_code == 200
+    assert get_response.json() == {"message": "hello"}
+    assert upstream_called is False
+
+
+@pytest.mark.anyio
 async def test_anthropic_upstream_is_passthrough() -> None:
     original = {
         "model": "claude",

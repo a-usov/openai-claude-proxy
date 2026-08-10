@@ -355,12 +355,18 @@ There are unavoidable semantic differences between providers:
   instead of silently moved. Reported cache reads and writes are mapped into
   Anthropic usage fields. See OpenAI's
   [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
-- Anthropic `thinking`, context-management, service-tier, container, inference-geo,
+- Anthropic adaptive and disabled `thinking` modes are accepted while explicit
+  `output_config.effort` continues to control OpenAI reasoning effort. The
+  `thinking.display` setting needs no OpenAI field because translated responses do
+  not expose raw reasoning. Fixed `thinking.type: enabled` token budgets have no
+  equivalent effort level and return HTTP 400 instead of being guessed. Claude
+  Code's `clear_thinking_20251015` context edit with `keep: all` is accepted as a
+  no-op; context edits that actually remove history remain unsupported.
+- Other context-management strategies, service-tier, container, inference-geo,
   top-k, user-profile attribution, hosted/server tools, eager tool-input streaming,
   and tool input examples have no sufficiently close portable meaning and return
   HTTP 400 on translated routes. Anthropic pass-through sends these fields and
-  future fields without rewriting the JSON body. Request-level
-  `output_config.effort` is translated separately from Anthropic thinking budgets.
+  future fields without rewriting the JSON body.
 - In the default `auto` mode, the Responses backend converts the full count request
   and calls `/responses/input_tokens`, preserving upstream errors, request IDs, and
   retry metadata. Chat Completions has no exact count endpoint, and compatible

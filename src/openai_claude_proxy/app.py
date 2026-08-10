@@ -225,6 +225,10 @@ def create_app(
             "openai_api": configured.openai_api,
         }
 
+    @app.api_route("/api/hello", methods=["GET", "HEAD"])
+    async def claude_code_hello() -> Response:
+        return Response('{"message": "hello"}', media_type="application/json")
+
     @app.get("/v1/models")
     async def models(request: Request) -> Response:
         if configured.model_discovery:

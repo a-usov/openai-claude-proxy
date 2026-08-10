@@ -179,6 +179,102 @@ def test_anthropic_effort_is_translated_for_gpt_56_models() -> None:
         assert result["reasoning_effort"] == effort
 
 
+@pytest.mark.parametrize(
+    "thinking",
+    [
+        {"type": "adaptive"},
+        {"type": "adaptive", "display": "omitted"},
+        {"type": "adaptive", "display": "summarized"},
+        {"type": "disabled"},
+    ],
+)
+@pytest.mark.parametrize(
+    ("converter", "reasoning_field"),
+    [
+        (anthropic_to_openai, "reasoning_effort"),
+        (anthropic_to_responses, "reasoning"),
+    ],
+)
+def test_claude_code_thinking_modes_preserve_explicit_effort(
+    thinking: dict[str, str],
+    converter: Callable[[dict[str, Any], Settings], dict[str, Any]],
+    reasoning_field: str,
+) -> None:
+    result = converter(
+        {
+            "model": "claude-opus-4-6",
+            "max_tokens": 64000,
+            "messages": [{"role": "user", "content": "Solve this"}],
+            "thinking": thinking,
+            "output_config": {"effort": "high"},
+        },
+        Settings(),
+    )
+
+    expected = "high" if reasoning_field == "reasoning_effort" else {"effort": "high"}
+    assert result[reasoning_field] == expected
+
+
+@pytest.mark.parametrize("converter", [anthropic_to_openai, anthropic_to_responses])
+def test_manual_thinking_budget_is_rejected_without_guessing_effort(
+    converter: Callable[[dict[str, Any], Settings], dict[str, Any]],
+) -> None:
+    with pytest.raises(ConversionError, match="fixed token budget"):
+        converter(
+            {
+                "model": "claude-opus-4-6",
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": "Solve this"}],
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+            },
+            Settings(),
+        )
+
+
+@pytest.mark.parametrize("converter", [anthropic_to_openai, anthropic_to_responses])
+def test_claude_code_keep_all_thinking_context_directive_is_a_safe_noop(
+    converter: Callable[[dict[str, Any], Settings], dict[str, Any]],
+) -> None:
+    result = converter(
+        {
+            "model": "claude-opus-4-6",
+            "max_tokens": 64000,
+            "messages": [{"role": "user", "content": "Solve this"}],
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "context_management": {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}],
+            },
+            "output_config": {"effort": "high"},
+        },
+        Settings(),
+    )
+
+    assert result["model"] == "claude-opus-4-6"
+
+
+@pytest.mark.parametrize("converter", [anthropic_to_openai, anthropic_to_responses])
+def test_context_management_that_changes_history_remains_rejected(
+    converter: Callable[[dict[str, Any], Settings], dict[str, Any]],
+) -> None:
+    with pytest.raises(ConversionError, match="changes conversation context"):
+        converter(
+            {
+                "model": "claude-opus-4-6",
+                "max_tokens": 64000,
+                "messages": [{"role": "user", "content": "Solve this"}],
+                "context_management": {
+                    "edits": [
+                        {
+                            "type": "clear_thinking_20251015",
+                            "keep": {"type": "thinking_turns", "value": 2},
+                        },
+                    ],
+                },
+            },
+            Settings(),
+        )
+
+
 def test_effort_mapping_can_remap_or_omit_provider_specific_levels() -> None:
     base = {
         "model": "claude-opus-5",
@@ -838,10 +934,8 @@ def test_responses_rejects_stop_sequences_instead_of_dropping_them() -> None:
     [
         "anthropic-user-profile-id",
         "container",
-        "context_management",
         "inference_geo",
         "service_tier",
-        "thinking",
         "top_k",
     ],
 )
@@ -852,10 +946,8 @@ def test_unsupported_anthropic_capability_fields_are_rejected(
     values = {
         "anthropic-user-profile-id": "profile_1",
         "container": "container_1",
-        "context_management": {"edits": []},
         "inference_geo": "us",
         "service_tier": "standard_only",
-        "thinking": {"type": "adaptive"},
         "top_k": 10,
     }
     request = {

@@ -40,10 +40,8 @@ _TOP_LEVEL_FIELDS = frozenset(
 _UNSUPPORTED_TOP_LEVEL_FIELDS = (
     "anthropic-user-profile-id",
     "container",
-    "context_management",
     "inference_geo",
     "service_tier",
-    "thinking",
     "top_k",
 )
 _TOOL_FIELDS = frozenset(
@@ -71,6 +69,7 @@ _PROGRAMMATIC_CALLERS = frozenset(
 )
 MAX_MESSAGES = 100_000
 MAX_PROMPT_CACHE_BREAKPOINTS = 4
+MIN_THINKING_BUDGET_TOKENS = 1024
 
 
 def _is_number(value: object) -> bool:
@@ -253,6 +252,66 @@ def _validate_output_config(payload: dict[str, Any]) -> None:
         raise ConversionError("legacy effort must be low, medium, high, xhigh, max, or none")
 
 
+def _validate_thinking(value: object, max_tokens: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ConversionError("thinking must be an object or null")
+    thinking_type = value.get("type")
+    if thinking_type == "adaptive":
+        _reject_unknown_fields(value, frozenset({"display", "type"}), "thinking")
+    elif thinking_type == "disabled":
+        _reject_unknown_fields(value, frozenset({"type"}), "thinking")
+    elif thinking_type == "enabled":
+        _reject_unknown_fields(
+            value,
+            frozenset({"budget_tokens", "display", "type"}),
+            "thinking",
+        )
+        budget_tokens = value.get("budget_tokens")
+        if (
+            not isinstance(budget_tokens, int)
+            or isinstance(budget_tokens, bool)
+            or budget_tokens < MIN_THINKING_BUDGET_TOKENS
+        ):
+            raise ConversionError("thinking.budget_tokens must be an integer of at least 1024")
+        if (
+            isinstance(max_tokens, int)
+            and not isinstance(max_tokens, bool)
+            and budget_tokens >= max_tokens
+        ):
+            raise ConversionError("thinking.budget_tokens must be less than max_tokens")
+        raise ConversionError(
+            "thinking.type 'enabled' uses a fixed token budget with no safe OpenAI translation; "
+            "use adaptive thinking with output_config.effort",
+        )
+    else:
+        raise ConversionError("thinking.type must be 'adaptive', 'disabled', or 'enabled'")
+    display = value.get("display")
+    if display is not None and display not in {"omitted", "summarized"}:
+        raise ConversionError("thinking.display must be 'omitted' or 'summarized'")
+
+
+def _validate_context_management(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ConversionError("context_management must be an object or null")
+    _reject_unknown_fields(value, frozenset({"edits"}), "context_management")
+    edits = value.get("edits")
+    if not isinstance(edits, list):
+        raise ConversionError("context_management.edits must be an array")
+    for index, edit in enumerate(edits):
+        path = f"context_management.edits[{index}]"
+        if not isinstance(edit, dict):
+            raise ConversionError(f"{path} must be an object")
+        _reject_unknown_fields(edit, frozenset({"keep", "type"}), path)
+        if edit.get("type") != "clear_thinking_20251015" or edit.get("keep") != "all":
+            raise ConversionError(
+                f"{path} changes conversation context and has no safe OpenAI translation",
+            )
+
+
 def _validate_tools(value: object, backend: Backend) -> None:
     if value is None:
         return
@@ -406,6 +465,8 @@ def prepare_anthropic_request(
         )
     _validate_system(payload.get("system"), backend)
     _validate_output_config(payload)
+    _validate_thinking(payload.get("thinking"), max_tokens)
+    _validate_context_management(payload.get("context_management"))
     _validate_tools(payload.get("tools"), backend)
     _validate_tool_choice(payload.get("tool_choice"))
     for field in _UNSUPPORTED_TOP_LEVEL_FIELDS:
