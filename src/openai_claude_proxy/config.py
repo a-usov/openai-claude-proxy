@@ -9,6 +9,8 @@ from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl
 
+from .models import automatic_upstream_model
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -76,6 +78,12 @@ def _csv(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(part.strip().lower() for part in value.split(",") if part.strip())
 
 
+def _patterns(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if value is None:
+        return default
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
 def _reasoning_effort_map(value: str | None) -> dict[str, str | None]:
     result = DEFAULT_REASONING_EFFORT_MAP.copy()
     if value is None:
@@ -95,12 +103,14 @@ class Settings:
     """Hold validated proxy settings loaded directly or from the environment."""
 
     upstream_base_url: str = "https://api.openai.com/v1"
+    upstream_models_base_url: str | None = None
     upstream_protocol: str = "openai"
     openai_api: str = "chat_completions"
     upstream_chat_path: str = "/chat/completions"
     upstream_responses_path: str = "/responses"
     upstream_responses_input_tokens_path: str = "/responses/input_tokens"
     upstream_messages_path: str = "/messages"
+    upstream_models_path: str = "/models"
     auth_mode: str = "passthrough"
     upstream_api_key: str | None = None
     upstream_api_key_header: str = "authorization"
@@ -130,8 +140,12 @@ class Settings:
     upstream_query: dict[str, str] = field(default_factory=dict)
     model_map: dict[str, str] = field(default_factory=dict)
     model_discovery: dict[str, str] = field(default_factory=dict)
+    model_discovery_mode: str = "passthrough"
+    model_discovery_include: tuple[str, ...] = ("*",)
+    model_discovery_exclude: tuple[str, ...] = ()
     model_override: str | None = None
     max_tokens_field: str = "max_tokens"
+    min_output_tokens: int = 1
     reasoning_effort_enabled: bool = True
     reasoning_effort_map: dict[str, str | None] = field(
         default_factory=DEFAULT_REASONING_EFFORT_MAP.copy,
@@ -153,8 +167,11 @@ class Settings:
     def __post_init__(self) -> None:
         """Normalize and validate configuration after initialization."""
         self.upstream_base_url = self.upstream_base_url.rstrip("/")
+        if self.upstream_models_base_url:
+            self.upstream_models_base_url = self.upstream_models_base_url.rstrip("/")
         self.upstream_protocol = self.upstream_protocol.lower()
         self.openai_api = self.openai_api.lower()
+        self.model_discovery_mode = self.model_discovery_mode.lower()
         self.auth_mode = self.auth_mode.lower()
         self.upstream_api_key_header = self.upstream_api_key_header.lower()
         self.passthrough_strip_prefix = self.passthrough_strip_prefix.rstrip("/")
@@ -168,6 +185,12 @@ class Settings:
             raise ConfigError("UPSTREAM_PROTOCOL must be 'openai' or 'anthropic'")
         if self.openai_api not in {"chat_completions", "responses"}:
             raise ConfigError("OPENAI_API must be 'chat_completions' or 'responses'")
+        if self.model_discovery_mode not in {"auto", "passthrough"}:
+            raise ConfigError("MODEL_DISCOVERY_MODE must be 'auto' or 'passthrough'")
+        if self.model_discovery_mode == "auto" and self.upstream_protocol != "openai":
+            raise ConfigError("MODEL_DISCOVERY_MODE=auto requires UPSTREAM_PROTOCOL=openai")
+        if not self.model_discovery_include:
+            raise ConfigError("MODEL_DISCOVERY_INCLUDE must contain at least one pattern")
         if self.auth_mode not in {
             "passthrough",
             "bearer",
@@ -189,6 +212,8 @@ class Settings:
             raise ConfigError("TOKEN_COUNT_FALLBACK must be 'estimate' or 'unsupported'")
         if self.max_tokens_field not in {"max_tokens", "max_completion_tokens"}:
             raise ConfigError("MAX_TOKENS_FIELD must be 'max_tokens' or 'max_completion_tokens'")
+        if self.min_output_tokens < 1:
+            raise ConfigError("MIN_OUTPUT_TOKENS must be a positive integer")
         if self.stream_ping_interval < 0:
             raise ConfigError("STREAM_PING_INTERVAL must be zero or greater")
         for setting_name, size in (
@@ -217,8 +242,16 @@ class Settings:
                 raise ConfigError(
                     "MODEL_DISCOVERY IDs must begin with 'claude' or 'anthropic' for Claude Code",
                 )
-            if not self.model_override and not any(
-                model_id == pattern or fnmatchcase(model_id, pattern) for pattern in self.model_map
+            if (
+                not self.model_override
+                and not any(
+                    model_id == pattern or fnmatchcase(model_id, pattern)
+                    for pattern in self.model_map
+                )
+                and not (
+                    self.model_discovery_mode == "auto"
+                    and automatic_upstream_model(model_id) is not None
+                )
             ):
                 raise ConfigError(
                     f"MODEL_DISCOVERY alias {model_id!r} must match MODEL_MAP or MODEL_OVERRIDE",
@@ -263,6 +296,7 @@ class Settings:
         }
         return cls(
             upstream_base_url=env.get("UPSTREAM_BASE_URL", defaults.upstream_base_url),
+            upstream_models_base_url=env.get("UPSTREAM_MODELS_BASE_URL"),
             upstream_protocol=env.get("UPSTREAM_PROTOCOL", defaults.upstream_protocol),
             openai_api=env.get("OPENAI_API", defaults.openai_api),
             upstream_chat_path=env.get("UPSTREAM_CHAT_PATH", defaults.upstream_chat_path),
@@ -277,6 +311,10 @@ class Settings:
             upstream_messages_path=env.get(
                 "UPSTREAM_MESSAGES_PATH",
                 defaults.upstream_messages_path,
+            ),
+            upstream_models_path=env.get(
+                "UPSTREAM_MODELS_PATH",
+                defaults.upstream_models_path,
             ),
             auth_mode=env.get("AUTH_MODE", defaults.auth_mode),
             upstream_api_key=env.get("UPSTREAM_API_KEY"),
@@ -301,8 +339,23 @@ class Settings:
             upstream_query=query,
             model_map=model_map,
             model_discovery=model_discovery,
+            model_discovery_mode=env.get(
+                "MODEL_DISCOVERY_MODE",
+                defaults.model_discovery_mode,
+            ),
+            model_discovery_include=_patterns(
+                env.get("MODEL_DISCOVERY_INCLUDE"),
+                defaults.model_discovery_include,
+            ),
+            model_discovery_exclude=_patterns(
+                env.get("MODEL_DISCOVERY_EXCLUDE"),
+                defaults.model_discovery_exclude,
+            ),
             model_override=env.get("MODEL_OVERRIDE") or env.get("DEFAULT_MODEL"),
             max_tokens_field=env.get("MAX_TOKENS_FIELD", defaults.max_tokens_field),
+            min_output_tokens=int(
+                env.get("MIN_OUTPUT_TOKENS", defaults.min_output_tokens),
+            ),
             reasoning_effort_enabled=_boolean(
                 env.get("REASONING_EFFORT_ENABLED"),
                 default=defaults.reasoning_effort_enabled,
@@ -341,7 +394,7 @@ class Settings:
         )
 
     def map_model(self, requested: str) -> str:
-        """Map a client model using override, exact, glob, then pass-through order."""
+        """Map a client model using override, exact, glob, automatic, then pass-through order."""
         if self.model_override:
             return self.model_override
         if requested in self.model_map:
@@ -349,8 +402,17 @@ class Settings:
         for pattern, replacement in self.model_map.items():
             if fnmatchcase(requested, pattern):
                 return replacement
+        if self.model_discovery_mode == "auto" and (
+            upstream_model := automatic_upstream_model(requested)
+        ):
+            return upstream_model
         return requested
 
     def upstream_url(self, path: str) -> str:
         """Join a configured relative API path to the fixed upstream origin."""
         return f"{self.upstream_base_url}/{path.lstrip('/')}"
+
+    def upstream_model_list_url(self) -> str:
+        """Join the model-list path to its optional separately configured origin."""
+        base_url = self.upstream_models_base_url or self.upstream_base_url
+        return f"{base_url}/{self.upstream_models_path.lstrip('/')}"

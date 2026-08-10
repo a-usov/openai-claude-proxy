@@ -115,12 +115,14 @@ All configuration is via environment variables.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | Fixed upstream base URL |
+| `UPSTREAM_MODELS_BASE_URL` | unset | Optional fixed base URL for a separately hosted model catalog |
 | `UPSTREAM_PROTOCOL` | `openai` | `openai` translates Messages; `anthropic` passes them through |
 | `OPENAI_API` | `chat_completions` | Translation backend: `chat_completions` or `responses` |
 | `UPSTREAM_CHAT_PATH` | `/chat/completions` | OpenAI Chat Completions path relative to the base |
 | `UPSTREAM_RESPONSES_PATH` | `/responses` | OpenAI Responses path relative to the base |
 | `UPSTREAM_RESPONSES_INPUT_TOKENS_PATH` | `/responses/input_tokens` | Responses exact input-token count path relative to the base |
 | `UPSTREAM_MESSAGES_PATH` | `/messages` | Anthropic Messages path relative to the base |
+| `UPSTREAM_MODELS_PATH` | `/models` | Model-list path relative to its configured base |
 | `AUTH_MODE` | `passthrough` | `passthrough`, `bearer`, `api-key`, `x-api-key`, `static`, or `none` |
 | `UPSTREAM_API_KEY` | unset | Credential used only by `AUTH_MODE=static` |
 | `UPSTREAM_API_KEY_HEADER` | `authorization` | Header used by static auth |
@@ -128,7 +130,11 @@ All configuration is via environment variables.
 | `MODEL_OVERRIDE` | unset | Replace every client model with this deployment/model name |
 | `MODEL_MAP` | `{}` | JSON exact/glob model mapping, evaluated in insertion order |
 | `MODEL_DISCOVERY` | `{}` | Static JSON map of Claude-visible model IDs to display names |
+| `MODEL_DISCOVERY_MODE` | `passthrough` | `auto` converts an upstream OpenAI model list into Claude aliases |
+| `MODEL_DISCOVERY_INCLUDE` | `*` | Comma-separated upstream model-ID globs included by automatic discovery |
+| `MODEL_DISCOVERY_EXCLUDE` | unset | Comma-separated upstream model-ID globs excluded by automatic discovery |
 | `MAX_TOKENS_FIELD` | `max_tokens` | Use `max_completion_tokens` for upstreams that require the newer name |
+| `MIN_OUTPUT_TOKENS` | `1` | Raise smaller client output limits to an explicit upstream minimum |
 | `REASONING_EFFORT_ENABLED` | `true` | Translate Claude request effort into OpenAI reasoning effort |
 | `REASONING_EFFORT_MAP` | identity map | JSON overrides for individual effort levels; `null` omits a level |
 | `UPSTREAM_QUERY` | unset | URL-encoded query parameters appended to upstream calls |
@@ -199,15 +205,23 @@ dynamic value. For Chat-only gateways that require it, set
 `MAX_TOKENS_FIELD=max_completion_tokens`; Responses always uses
 `max_output_tokens`.
 
+Some gateways reject Claude Code's one-token model-selection probe because they
+require at least 16 output tokens. Set `MIN_OUTPUT_TOKENS=16` to raise smaller
+translated Chat and Responses limits to that floor. This compatibility option is
+intentionally opt-in: the upstream may generate and bill for more tokens than the
+client requested, and the proxy does not truncate the result.
+
 OpenAI recommends the Responses API for GPT-5.6 reasoning, tool-calling, and
 multi-turn workflows. Select it with `OPENAI_API=responses`. Requests default to
 `store=false`, avoiding server-side response retention unless explicitly overridden
-with `EXTRA_OPENAI_BODY`. For stateless conversations, the proxy encodes the exact
-ordered `response.output` array in a proxy-marked Anthropic `redacted_thinking`
-block. Claude Code returns that block with later history, allowing the proxy to
-replay provider message IDs, statuses, annotations, reasoning, and function-call
-metadata without process-local conversation storage. Manually authored Anthropic
-assistant text uses schema-valid Responses easy-input messages instead.
+with `EXTRA_OPENAI_BODY`. When stateless reasoning is active, the proxy also requests
+`reasoning.encrypted_content` for compatibility with Azure Foundry and older OpenAI
+Responses implementations. For stateless conversations, the proxy encodes the exact
+ordered `response.output` array in a proxy-marked Anthropic `redacted_thinking` block.
+Claude Code returns that block with later history, allowing the proxy to replay
+provider message IDs, statuses, annotations, reasoning, and function-call metadata
+without process-local conversation storage. Manually authored Anthropic assistant
+text uses schema-valid Responses easy-input messages instead.
 
 Visible text and tool calls remain normal Anthropic blocks. On replay, the proxy
 validates those blocks against the carried output and sends each original OpenAI
@@ -243,9 +257,10 @@ export MODEL_MAP='{
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 ```
 
-When `MODEL_DISCOVERY` is empty, `GET /v1/models` continues to pass through to
-the configured upstream without normalizing its OpenAI response shape. When static
-discovery is configured, list and retrieve responses follow Anthropic's Models API:
+When `MODEL_DISCOVERY` is empty and `MODEL_DISCOVERY_MODE` remains `passthrough`,
+`GET /v1/models` continues to pass through to the configured upstream without
+normalizing its OpenAI response shape. When static discovery is configured, list
+and retrieve responses follow Anthropic's Models API:
 entries include `type: "model"`, unknown release dates use the Unix epoch, and
 `limit`, `after_id`, and `before_id` cursor pagination are supported. Discovery does
 not expose credentials or upstream URLs. Every published alias must be covered by
@@ -253,6 +268,44 @@ not expose credentials or upstream URLs. Every published alias must be covered b
 from being sent accidentally as an upstream model ID. To declare intentional
 pass-through, add an explicit identity entry such as
 `{"claude-upstream-id":"claude-upstream-id"}`.
+
+For gateways that expose a standard OpenAI-compatible model list, discovery and
+mapping can instead be automatic:
+
+```bash
+export MODEL_DISCOVERY_MODE=auto
+export MODEL_DISCOVERY_INCLUDE='gateway-gpt-*,gateway-kimi-*,gateway-gemini-*'
+export MODEL_DISCOVERY_EXCLUDE='*embedding*,*audio*,*image*'
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+```
+
+The proxy fetches `UPSTREAM_MODELS_PATH` with the same request credential used for
+inference, reads each entry's `id` and optional `display_name`, and publishes a
+reversible ID beginning with `claude-proxy-`. For example,
+`gateway-gpt-reasoning` becomes `claude-proxy-gateway-gpt-reasoning`; selecting it
+maps back to the exact upstream `id` without a process-local cache. URL-unsafe and
+Unicode model IDs are escaped reversibly. Static `MODEL_DISCOVERY` entries are
+merged first and can provide curated names. `MODEL_OVERRIDE`, exact `MODEL_MAP`,
+and glob `MODEL_MAP` entries retain precedence over automatic decoding.
+
+If the model catalog is hosted outside the inference base, configure its fixed
+origin separately:
+
+```bash
+export UPSTREAM_MODELS_BASE_URL='https://catalog.example.com/openai/v1'
+export UPSTREAM_MODELS_PATH='/models'
+```
+
+The standard Models API does not declare whether a model supports Messages,
+Responses, tools, images, or embeddings. Use the case-sensitive include/exclude
+globs to expose only models compatible with the configured translation backend.
+Automatic discovery is opt-in because a shared helper credential may expose a
+larger catalog than every user should see. The proxy fetches the catalog per
+discovery request and does not cache one credential's model access for another.
+Unset `MODEL_OVERRIDE` when users need picker selections to route to different
+upstream models. The `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` flag must be in
+Claude Code's environment, while the other variables must be in the proxy's
+environment.
 
 Static auth is useful when clients must not supply upstream credentials:
 
@@ -289,11 +342,12 @@ text, base64/URL images, multiple and strict function tools, tool results,
 structured JSON output, reasoning effort, `metadata.user_id` attribution, sampling
 settings, prompt-cache breakpoints, and streaming. Mid-conversation Anthropic
 `system` roles become ordered OpenAI `developer` messages. Metadata user IDs become
-OpenAI `safety_identifier`; they are never logged. Responses also preserves text
-and image tool-result content and maps deferred tools plus direct/programmatic tool
-caller restrictions. Chat Completions supports text-only tool results. OpenAI
-content and function calls are translated back into Anthropic content blocks and
-correctly ordered event streams.
+OpenAI `safety_identifier`; identifiers over OpenAI's 64-character limit become a
+stable SHA-256 digest instead of being truncated, and are never logged. Responses
+also preserves text and image tool-result content and maps deferred tools plus
+direct/programmatic tool caller restrictions. Chat Completions supports text-only
+tool results. OpenAI content and function calls are translated back into Anthropic
+content blocks and correctly ordered event streams.
 During an upstream pause, the proxy emits Anthropic `ping` events so Claude Code's
 stream watchdog remains active. Claude Code attribution headers are forwarded;
 Anthropic pass-through additionally preserves future `anthropic-*` and

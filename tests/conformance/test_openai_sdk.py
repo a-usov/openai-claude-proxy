@@ -84,6 +84,7 @@ def _validate_translated_request_wires() -> None:
         "store": False,
         "instructions": "Use tools.",
         "reasoning": {"effort": "high"},
+        "include": ["reasoning.encrypted_content"],
         "tools": [
             {
                 "type": "function",

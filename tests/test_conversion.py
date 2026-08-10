@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,6 +19,7 @@ from openai_claude_proxy.conversion import (
     responses_stop_reason,
     responses_to_anthropic,
 )
+from openai_claude_proxy.models import automatic_model_alias
 from openai_claude_proxy.reasoning_state import (
     decode_responses_output,
     decode_responses_reasoning,
@@ -137,6 +139,29 @@ def test_model_passes_through_by_default_and_can_be_explicitly_overridden() -> N
     )
 
 
+def test_automatic_model_mapping_follows_explicit_mapping_precedence() -> None:
+    luna_alias = automatic_model_alias("gateway-gpt-5-6-luna")
+    terra_alias = automatic_model_alias("gateway-gpt-5-6-terra")
+    settings = Settings(
+        model_discovery_mode="auto",
+        model_map={
+            luna_alias: "curated-luna-deployment",
+            "claude-proxy-gateway-gpt-*": "curated-gpt-deployment",
+        },
+    )
+
+    assert settings.map_model(luna_alias) == "curated-luna-deployment"
+    assert settings.map_model(terra_alias) == "curated-gpt-deployment"
+    assert settings.map_model(automatic_model_alias("kimi-k2.5")) == "kimi-k2.5"
+    assert settings.map_model("claude-built-in") == "claude-built-in"
+    assert (
+        Settings(model_discovery_mode="auto", model_override="one-deployment").map_model(
+            luna_alias,
+        )
+        == "one-deployment"
+    )
+
+
 def test_tool_errors_and_configurable_token_field_are_preserved() -> None:
     result = anthropic_to_openai(
         {
@@ -162,6 +187,25 @@ def test_tool_errors_and_configurable_token_field_are_preserved() -> None:
     assert "max_tokens" not in result
     assert result["max_completion_tokens"] == 50
     assert result["messages"][0]["content"] == "[Tool error]\ncommand failed"
+
+
+def test_minimum_output_tokens_supports_gateway_request_floors() -> None:
+    request = {
+        "model": "claude",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "identify yourself"}],
+    }
+    settings = Settings(min_output_tokens=16)
+
+    assert anthropic_to_openai(request, settings)["max_tokens"] == 16
+    assert anthropic_to_responses(request, settings)["max_output_tokens"] == 16
+    assert anthropic_to_responses(request, Settings())["max_output_tokens"] == 1
+    assert Settings.from_env({"MIN_OUTPUT_TOKENS": "16"}).min_output_tokens == 16
+
+
+def test_minimum_output_tokens_must_be_positive() -> None:
+    with pytest.raises(ConfigError, match="MIN_OUTPUT_TOKENS"):
+        Settings(min_output_tokens=0)
 
 
 def test_anthropic_effort_is_translated_for_gpt_56_models() -> None:
@@ -510,6 +554,7 @@ def test_anthropic_request_converts_to_typed_responses_items() -> None:
     assert result["max_output_tokens"] == 500
     assert result["store"] is False
     assert result["reasoning"] == {"effort": "max"}
+    assert result["include"] == ["reasoning.encrypted_content"]
     assert result["parallel_tool_calls"] is False
     assert result["tool_choice"] == "required"
     assert result["tools"][0]["strict"] is True
@@ -534,6 +579,21 @@ def test_anthropic_request_converts_to_typed_responses_items() -> None:
             "content": [{"type": "input_image", "image_url": "data:image/png;base64,abc"}],
         },
     ]
+
+
+def test_responses_does_not_force_encrypted_reasoning_for_stored_responses() -> None:
+    result = anthropic_to_responses(
+        {
+            "model": "claude-test",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "output_config": {"effort": "high"},
+        },
+        Settings(extra_openai_body={"store": True}),
+    )
+
+    assert result["store"] is True
+    assert "include" not in result
 
 
 def test_responses_preserves_system_cache_breakpoint_in_developer_input() -> None:
@@ -724,6 +784,36 @@ def test_responses_content_filter_without_refusal_text_uses_refusal_stop_reason(
 
     assert result["stop_reason"] == "refusal"
     assert result["stop_details"] == {"type": "refusal", "explanation": None}
+
+
+def test_responses_completed_without_visible_output_is_rejected() -> None:
+    with pytest.raises(
+        ConversionError,
+        match="completed without assistant text or a function call",
+    ):
+        responses_to_anthropic(
+            {
+                "id": "resp_empty",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+            "claude-test",
+        )
+
+
+def test_responses_buffered_error_event_preserves_provider_message() -> None:
+    with pytest.raises(ConversionError, match="tool configuration is unsupported"):
+        responses_to_anthropic(
+            {
+                "type": "error",
+                "sequence_number": 1,
+                "code": "unsupported_tool_configuration",
+                "message": "tool configuration is unsupported",
+                "param": None,
+            },
+            "claude-test",
+        )
 
 
 @pytest.mark.parametrize("arguments", ["not-json", "[]", '"scalar"', "42", False])
@@ -1074,6 +1164,31 @@ def test_metadata_and_mid_conversation_system_roles_translate_for_both_backends(
     }
 
 
+@pytest.mark.parametrize("converter", [anthropic_to_openai, anthropic_to_responses])
+@pytest.mark.parametrize("stream", [False, True])
+def test_overlong_metadata_user_id_becomes_stable_safety_identifier(
+    converter: Callable[[dict[str, Any], Settings], dict[str, Any]],
+    *,
+    stream: bool,
+) -> None:
+    user_id = "claude-code-user:" + "x" * 133
+    source = {
+        "model": "claude-test",
+        "max_tokens": 100,
+        "stream": stream,
+        "metadata": {"user_id": user_id},
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+
+    converted = converter(source, Settings())
+
+    expected = hashlib.sha256(user_id.encode()).hexdigest()
+    assert converted["safety_identifier"] == expected
+    assert converted["stream"] is stream
+    assert len(converted["safety_identifier"]) == 64
+    assert user_id not in str(converted)
+
+
 def test_responses_maps_tool_callers_and_deferred_loading() -> None:
     source = {
         "model": "claude-test",
@@ -1328,16 +1443,27 @@ def test_responses_settings_are_loaded_and_validated() -> None:
     settings = Settings.from_env(
         {
             "OPENAI_API": "responses",
+            "UPSTREAM_MODELS_BASE_URL": "https://catalog.example/v1",
             "UPSTREAM_RESPONSES_PATH": "/custom/responses",
+            "UPSTREAM_MODELS_PATH": "/custom/models",
             "MODEL_DISCOVERY": '{"claude-gpt-5-6":"GPT-5.6"}',
             "MODEL_MAP": '{"claude-gpt-5-6":"gpt-5.6"}',
+            "MODEL_DISCOVERY_MODE": "auto",
+            "MODEL_DISCOVERY_INCLUDE": "gateway-gpt-*,kimi-*",
+            "MODEL_DISCOVERY_EXCLUDE": "*-embedding-*,*-audio-*",
             "STREAM_PING_INTERVAL": "9.5",
         },
     )
 
     assert settings.openai_api == "responses"
+    assert settings.upstream_models_base_url == "https://catalog.example/v1"
     assert settings.upstream_responses_path == "/custom/responses"
+    assert settings.upstream_models_path == "/custom/models"
     assert settings.model_discovery == {"claude-gpt-5-6": "GPT-5.6"}
+    assert settings.model_discovery_mode == "auto"
+    assert settings.model_discovery_include == ("gateway-gpt-*", "kimi-*")
+    assert settings.model_discovery_exclude == ("*-embedding-*", "*-audio-*")
+    assert settings.upstream_model_list_url() == "https://catalog.example/v1/custom/models"
     assert settings.stream_ping_interval == 9.5
 
     with pytest.raises(ConfigError, match="must begin with 'claude' or 'anthropic'"):
@@ -1346,6 +1472,12 @@ def test_responses_settings_are_loaded_and_validated() -> None:
         Settings(model_discovery={"gateway-claude-model": "Hidden Claude model"})
     with pytest.raises(ConfigError, match="must match MODEL_MAP or MODEL_OVERRIDE"):
         Settings(model_discovery={"claude-unmapped": "Unmapped"})
+    with pytest.raises(ConfigError, match="MODEL_DISCOVERY_MODE"):
+        Settings(model_discovery_mode="future")
+    with pytest.raises(ConfigError, match="requires UPSTREAM_PROTOCOL=openai"):
+        Settings(upstream_protocol="anthropic", model_discovery_mode="auto")
+    with pytest.raises(ConfigError, match="must contain at least one pattern"):
+        Settings(model_discovery_mode="auto", model_discovery_include=())
 
     passthrough = Settings(
         model_discovery={"claude-upstream-id": "Upstream model"},

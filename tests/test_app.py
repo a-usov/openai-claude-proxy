@@ -4,12 +4,14 @@ import asyncio
 import base64
 import json
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import httpx
 import pytest
 
 from openai_claude_proxy.app import create_app
 from openai_claude_proxy.config import Settings
+from openai_claude_proxy.models import automatic_model_alias
 from openai_claude_proxy.reasoning_state import (
     encode_responses_output,
     encode_responses_reasoning,
@@ -44,6 +46,12 @@ class SlowResponseStream(httpx.AsyncByteStream):
                     "response": {
                         "id": "resp_slow",
                         "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "done"}],
+                            },
+                        ],
                         "usage": {"input_tokens": 1, "output_tokens": 1},
                     },
                 },
@@ -485,7 +493,7 @@ async def test_malformed_and_unknown_stream_events_are_controlled_errors(
 
 
 @pytest.mark.anyio
-async def test_responses_standard_lifecycle_metadata_events_are_ignored_safely() -> None:
+async def test_responses_empty_completed_lifecycle_is_reported_as_an_error() -> None:
     response = httpx.Response(
         200,
         content=event_stream(
@@ -510,15 +518,17 @@ async def test_responses_standard_lifecycle_metadata_events_are_ignored_safely()
         [chunk async for chunk in responses_stream_to_anthropic(response, "claude-test")],
     ).decode()
 
-    assert "event: error" not in body
+    assert "event: error" in body
     assert "event: message_start" in body
-    assert "event: message_stop" in body
+    assert "Responses API completed without assistant text or a function call" in body
+    assert "event: message_stop" not in body
     assert response.is_closed
 
 
 @pytest.mark.anyio
 async def test_openai_route_is_transparently_forwarded() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "catalog.example"
         assert request.url.path == "/v1/models"
         assert request.headers["x-api-key"] == "helper-key"
         return httpx.Response(
@@ -528,7 +538,11 @@ async def test_openai_route_is_transparently_forwarded() -> None:
         )
 
     app = create_app(
-        Settings(upstream_base_url="https://gateway.example/v1", auth_mode="passthrough"),
+        Settings(
+            upstream_base_url="https://gateway.example/v1/proxy",
+            upstream_models_base_url="https://catalog.example/v1",
+            auth_mode="passthrough",
+        ),
         transport=httpx.MockTransport(handler),
     )
     async with (
@@ -570,6 +584,220 @@ async def test_model_discovery_rewrites_x_api_key_helper_credential() -> None:
         response = await client.get("/v1/models", headers={"x-api-key": "model-helper-key"})
 
     assert response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_automatic_model_discovery_aliases_and_routes_upstream_models() -> None:
+    catalog_requests = 0
+    luna_id = "gateway-gpt-5-6-luna"
+    kimi_id = "vendor/kimi-k2.5"
+    luna_alias = automatic_model_alias(luna_id)
+    kimi_alias = automatic_model_alias(kimi_id)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal catalog_requests
+        assert request.headers["authorization"] == "Bearer helper-key"
+        if request.url.host == "catalog.example":
+            catalog_requests += 1
+            assert request.method == "GET"
+            assert request.url.path == "/v1/models"
+            assert dict(request.url.params) == {"api-version": "test-version"}
+            return httpx.Response(
+                200,
+                headers={"x-request-id": "catalog-request-id"},
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": luna_id,
+                            "model_name": "gpt-5.6-luna",
+                            "object": "model",
+                            "display_name": "Gateway Luna",
+                        },
+                        {
+                            "id": kimi_id,
+                            "model_name": "kimi-k2.5",
+                            "object": "model",
+                            "display_name": "Kimi K2.5",
+                        },
+                        {
+                            "id": "text-embedding-3-large",
+                            "object": "model",
+                        },
+                    ],
+                },
+            )
+        assert request.url.host == "gateway.example"
+        assert request.url.path == "/v1/proxy/responses"
+        body = json.loads(request.content)
+        assert body["model"] == kimi_id
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_auto_model",
+                "model": kimi_id,
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_auto_model",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Automatic model routing works.",
+                                "annotations": [],
+                            },
+                        ],
+                    },
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 4},
+            },
+        )
+
+    app = create_app(
+        Settings(
+            upstream_base_url="https://gateway.example/v1/proxy",
+            upstream_models_base_url="https://catalog.example/v1",
+            upstream_models_path="/models",
+            upstream_responses_path="/responses",
+            upstream_query={"api-version": "test-version"},
+            openai_api="responses",
+            auth_mode="bearer",
+            model_discovery_mode="auto",
+            model_discovery_include=("gateway-gpt-*", "vendor/*"),
+            model_discovery_exclude=("text-embedding-*",),
+            model_discovery={luna_alias: "GPT-5.6 Luna"},
+            model_map={luna_alias: luna_id},
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        models = await client.get(
+            "/v1/models",
+            params={"limit": 100},
+            headers={"x-api-key": "helper-key"},
+        )
+        retrieved = await client.get(
+            f"/v1/models/{quote(kimi_alias, safe='')}",
+            headers={"x-api-key": "helper-key"},
+        )
+        completion = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": "helper-key"},
+            json={
+                "model": kimi_alias,
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+    assert models.status_code == 200
+    assert models.headers["x-request-id"] == "catalog-request-id"
+    assert models.json()["data"] == [
+        {
+            "id": luna_alias,
+            "display_name": "GPT-5.6 Luna",
+            "type": "model",
+            "created_at": "1970-01-01T00:00:00Z",
+        },
+        {
+            "id": kimi_alias,
+            "display_name": "Kimi K2.5",
+            "type": "model",
+            "created_at": "1970-01-01T00:00:00Z",
+        },
+    ]
+    assert retrieved.status_code == 200
+    assert retrieved.json()["id"] == kimi_alias
+    assert completion.status_code == 200
+    assert completion.json()["model"] == kimi_alias
+    assert (
+        next(block["text"] for block in completion.json()["content"] if block["type"] == "text")
+        == "Automatic model routing works."
+    )
+    assert catalog_requests == 2
+
+
+@pytest.mark.anyio
+async def test_automatic_model_discovery_rejects_malformed_upstream_list() -> None:
+    upstream: httpx.Response | None = None
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream
+        upstream = httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [{"id": 7, "secret": "must-not-appear"}],
+            },
+        )
+        return upstream
+
+    app = create_app(
+        Settings(model_discovery_mode="auto"),
+        transport=httpx.MockTransport(handler),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        response = await client.get("/v1/models")
+
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == ("Invalid response from upstream model discovery")
+    assert "must-not-appear" not in response.text
+    assert upstream is not None
+    assert upstream.is_closed
+
+
+@pytest.mark.anyio
+async def test_automatic_model_discovery_preserves_upstream_errors() -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"retry-after": "4", "x-request-id": "catalog-error-id"},
+            json={
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "Model catalog rate limit reached",
+                },
+            },
+        )
+
+    app = create_app(
+        Settings(model_discovery_mode="auto"),
+        transport=httpx.MockTransport(handler),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy",
+        ) as client,
+    ):
+        response = await client.get("/v1/models")
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "4"
+    assert response.json() == {
+        "type": "error",
+        "error": {
+            "type": "rate_limit_error",
+            "message": "Model catalog rate limit reached",
+        },
+        "request_id": "catalog-error-id",
+    }
 
 
 @pytest.mark.anyio
@@ -1504,6 +1732,7 @@ async def test_responses_backend_translates_request_and_buffered_response() -> N
             "stream": False,
             "store": False,
             "reasoning": {"effort": "high"},
+            "include": ["reasoning.encrypted_content"],
         },
         "session": "session-1",
         "agent": "agent-1",
@@ -2043,6 +2272,180 @@ async def test_responses_stream_recovers_text_from_authoritative_done_event() ->
 
     assert body.count('"type":"text_delta","text":"Recovered"') == 1
     assert '"stop_reason":"end_turn"' in body
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("sparse_source", ["terminal", "output_item_done"])
+async def test_responses_stream_recovers_text_from_sparse_completion(
+    sparse_source: str,
+) -> None:
+    message_item = {
+        "type": "message",
+        "id": "msg_sparse",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+    }
+    events: list[dict[str, object] | str] = [
+        {
+            "type": "response.created",
+            "response": {"id": "resp_sparse", "model": "gpt-test"},
+        },
+    ]
+    if sparse_source == "output_item_done":
+        events.append(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": message_item,
+            },
+        )
+    events.append(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_sparse",
+                "status": "completed",
+                "output": [message_item],
+            },
+        },
+    )
+    response = httpx.Response(200, content=event_stream(events))
+
+    body = b"".join(
+        [chunk async for chunk in responses_stream_to_anthropic(response, "claude-test")]
+    ).decode()
+
+    assert body.count('"type":"text_delta","text":"Hello!"') == 1
+    assert body.count('"content_block":{"type":"text","text":""}') == 1
+    assert body.index('"type":"text_delta","text":"Hello!"') < body.index(
+        '"stop_reason":"end_turn"',
+    )
+
+
+@pytest.mark.anyio
+async def test_responses_stream_recovers_unstreamed_text_suffix_from_completion() -> None:
+    message_item = {
+        "type": "message",
+        "id": "msg_partial",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+    }
+    response = httpx.Response(
+        200,
+        content=event_stream(
+            [
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "Hel",
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_partial",
+                        "status": "completed",
+                        "output": [message_item],
+                    },
+                },
+            ],
+        ),
+    )
+
+    body = b"".join(
+        [chunk async for chunk in responses_stream_to_anthropic(response, "claude-test")]
+    ).decode()
+
+    assert '"type":"text_delta","text":"Hel"' in body
+    assert '"type":"text_delta","text":"lo!"' in body
+    assert body.count('"content_block":{"type":"text","text":""}') == 1
+
+
+@pytest.mark.anyio
+async def test_responses_stream_does_not_reopen_text_for_duplicate_done_events() -> None:
+    message_item = {
+        "type": "message",
+        "id": "msg_done",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Done", "annotations": []}],
+    }
+    response = httpx.Response(
+        200,
+        content=event_stream(
+            [
+                {
+                    "type": "response.output_text.done",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "Done",
+                },
+                {
+                    "type": "response.content_part.done",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": message_item["content"][0],
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": message_item,
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_done",
+                        "status": "completed",
+                        "output": [message_item],
+                    },
+                },
+            ],
+        ),
+    )
+
+    body = b"".join(
+        [chunk async for chunk in responses_stream_to_anthropic(response, "claude-test")]
+    ).decode()
+
+    assert body.count('"content_block":{"type":"text","text":""}') == 1
+    assert body.count('"type":"text_delta","text":"Done"') == 1
+    assert body.count('"type":"content_block_stop","index":0') == 1
+
+
+@pytest.mark.anyio
+async def test_responses_stream_recovers_tool_call_from_sparse_completion() -> None:
+    function_item = {
+        "type": "function_call",
+        "id": "fc_sparse",
+        "call_id": "call_sparse",
+        "name": "read",
+        "arguments": '{"path":"README.md"}',
+    }
+    response = httpx.Response(
+        200,
+        content=event_stream(
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_sparse_tool",
+                        "status": "completed",
+                        "output": [function_item],
+                    },
+                },
+            ],
+        ),
+    )
+
+    body = b"".join(
+        [chunk async for chunk in responses_stream_to_anthropic(response, "claude-test")]
+    ).decode()
+
+    assert '"id":"call_sparse","name":"read"' in body
+    assert '"partial_json":"{\\"path\\":\\"README.md\\"}"' in body
+    assert '"stop_reason":"tool_use"' in body
 
 
 @pytest.mark.anyio

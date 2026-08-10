@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +20,13 @@ if TYPE_CHECKING:
 
 
 _PROMPT_CACHE_BREAKPOINT = {"mode": "explicit"}
+_MAX_SAFETY_IDENTIFIER_LENGTH = 64
+
+
+def _safety_identifier(user_id: str) -> str:
+    if len(user_id) <= _MAX_SAFETY_IDENTIFIER_LENGTH:
+        return user_id
+    return hashlib.sha256(user_id.encode()).hexdigest()
 
 
 def _with_cache_breakpoint(
@@ -272,7 +280,7 @@ def anthropic_to_openai(payload: dict[str, Any], settings: Settings) -> dict[str
     result: dict[str, Any] = {
         "model": settings.map_model(requested_model),
         "messages": messages,
-        settings.max_tokens_field: payload["max_tokens"],
+        settings.max_tokens_field: max(payload["max_tokens"], settings.min_output_tokens),
         "stream": payload.get("stream", False),
     }
     for source, target in (
@@ -291,7 +299,7 @@ def anthropic_to_openai(payload: dict[str, Any], settings: Settings) -> dict[str
             "json_schema": output_format,
         }
     if user_id := (payload.get("metadata") or {}).get("user_id"):
-        result["safety_identifier"] = user_id
+        result["safety_identifier"] = _safety_identifier(user_id)
 
     if tools := payload.get("tools"):
         result["tools"] = [_chat_tool(tool) for tool in tools]
@@ -584,7 +592,7 @@ def _anthropic_to_responses(
     if not token_count:
         result.update(
             {
-                "max_output_tokens": payload["max_tokens"],
+                "max_output_tokens": max(payload["max_tokens"], settings.min_output_tokens),
                 "stream": payload.get("stream", False),
                 "store": False,
             },
@@ -601,7 +609,7 @@ def _anthropic_to_responses(
     if output_format := _structured_output_format(payload):
         result["text"] = {"format": {"type": "json_schema", **output_format}}
     if user_id := (payload.get("metadata") or {}).get("user_id"):
-        result["safety_identifier"] = user_id
+        result["safety_identifier"] = _safety_identifier(user_id)
     if tools := payload.get("tools"):
         result["tools"] = [_responses_tool(tool) for tool in tools]
     translated_choice, parallel_tool_calls = _tool_choice(payload)
@@ -613,6 +621,13 @@ def _anthropic_to_responses(
         result["prompt_cache_options"] = {"mode": "explicit", "ttl": "30m"}
 
     result.update(settings.extra_openai_body)
+    if (
+        not token_count
+        and result.get("store") is False
+        and "reasoning" in result
+        and "include" not in result
+    ):
+        result["include"] = ["reasoning.encrypted_content"]
     return result
 
 
@@ -737,6 +752,11 @@ def responses_to_anthropic(
     request_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Translate one buffered OpenAI Responses result into an Anthropic message."""
+    if payload.get("type") == "error":
+        message = payload.get("message")
+        raise ConversionError(
+            message if isinstance(message, str) else "Responses API returned an error event",
+        )
     if payload.get("error"):
         error = payload["error"]
         message = error.get("message", "Responses API failed") if isinstance(error, dict) else error
@@ -779,6 +799,13 @@ def responses_to_anthropic(
     )
 
     status = payload.get("status")
+    has_visible_text = any(
+        block.get("type") == "text" and bool(block.get("text")) for block in visible_content
+    )
+    if status != "incomplete" and not (has_tool_call or has_visible_text):
+        raise ConversionError(
+            "Responses API completed without assistant text or a function call",
+        )
     incomplete_reason = (payload.get("incomplete_details") or {}).get("reason")
     stop_reason = responses_stop_reason(
         status=status,

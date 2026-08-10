@@ -18,7 +18,7 @@ from .conversion import (
     estimate_anthropic_tokens,
 )
 from .errors import anthropic_error
-from .models import model_info, model_page
+from .models import model_info, model_page, openai_model_aliases
 from .streaming import (
     anthropic_message_stream,
     passthrough_stream,
@@ -193,6 +193,112 @@ async def _count_openai_tokens(
     return JSONResponse({"input_tokens": input_tokens}, headers=headers)
 
 
+async def _automatic_discovered_models(
+    request: Request,
+    settings: Settings,
+    upstream_error: Callable[[httpx.Response], Awaitable[JSONResponse]],
+) -> tuple[dict[str, str], dict[str, str]] | Response:
+    headers = upstream_headers(request.headers, settings, json_body=False)
+    outbound = request.app.state.client.build_request(
+        "GET",
+        settings.upstream_model_list_url(),
+        headers=headers,
+        params=settings.upstream_query,
+    )
+    try:
+        upstream = await request.app.state.client.send(outbound, stream=True)
+    except httpx.TimeoutException:
+        return _error("Upstream model discovery timed out", 504)
+    except httpx.HTTPError:
+        return _error("Could not reach upstream model discovery", 502)
+    if upstream.status_code >= HTTP_CLIENT_ERROR:
+        return await upstream_error(upstream)
+    headers_out = _response_headers(upstream)
+    try:
+        raw = _require_response_body(
+            await _read_response_body(upstream, settings.max_response_body_bytes),
+            "Upstream model list exceeded the response size limit",
+        )
+        decoded = json.loads(raw)
+        automatic = openai_model_aliases(
+            decoded,
+            include=settings.model_discovery_include,
+            exclude=settings.model_discovery_exclude,
+        )
+    except (
+        httpx.HTTPError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        ConversionError,
+    ):
+        return _error("Invalid response from upstream model discovery", 502, "api_error")
+    finally:
+        await upstream.aclose()
+
+    aliases = settings.model_discovery.copy()
+    for alias, display_name in automatic.items():
+        aliases.setdefault(alias, display_name)
+    return aliases, headers_out
+
+
+async def _list_models(
+    request: Request,
+    settings: Settings,
+    forward_json: Callable[[Request, str, str | None], Awaitable[Response]],
+    upstream_error: Callable[[httpx.Response], Awaitable[JSONResponse]],
+) -> Response:
+    if settings.model_discovery_mode == "auto":
+        discovered = await _automatic_discovered_models(request, settings, upstream_error)
+        if isinstance(discovered, Response):
+            return discovered
+        aliases, headers = discovered
+        try:
+            page = model_page(aliases, request.query_params)
+        except ConversionError as exc:
+            return _error(str(exc))
+        return JSONResponse(page, headers=headers)
+    if settings.model_discovery:
+        try:
+            page = model_page(settings.model_discovery, request.query_params)
+        except ConversionError as exc:
+            return _error(str(exc))
+        return JSONResponse(page)
+    return await forward_json(
+        request,
+        settings.upstream_models_path,
+        settings.upstream_models_base_url,
+    )
+
+
+async def _retrieve_model(
+    request: Request,
+    model_id: str,
+    settings: Settings,
+    forward_json: Callable[[Request, str, str | None], Awaitable[Response]],
+    upstream_error: Callable[[httpx.Response], Awaitable[JSONResponse]],
+) -> Response:
+    if settings.model_discovery_mode == "auto":
+        discovered = await _automatic_discovered_models(request, settings, upstream_error)
+        if isinstance(discovered, Response):
+            return discovered
+        aliases, headers = discovered
+        display_name = aliases.get(model_id)
+        if display_name is None:
+            return _error("Model not found", 404)
+        return JSONResponse(model_info(model_id, display_name), headers=headers)
+    if settings.model_discovery:
+        display_name = settings.model_discovery.get(model_id)
+        if display_name is None:
+            return _error("Model not found", 404)
+        return JSONResponse(model_info(model_id, display_name))
+    models_path = settings.upstream_models_path.rstrip("/")
+    return await forward_json(
+        request,
+        f"{models_path}/{model_id}",
+        settings.upstream_models_base_url,
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -231,22 +337,17 @@ def create_app(
 
     @app.get("/v1/models")
     async def models(request: Request) -> Response:
-        if configured.model_discovery:
-            try:
-                page = model_page(configured.model_discovery, request.query_params)
-            except ConversionError as exc:
-                return _error(str(exc))
-            return JSONResponse(page)
-        return await forward_json(request, "/models")
+        return await _list_models(request, configured, forward_json, upstream_error)
 
     @app.get("/v1/models/{model_id}")
     async def retrieve_model(request: Request, model_id: str) -> Response:
-        if configured.model_discovery:
-            display_name = configured.model_discovery.get(model_id)
-            if display_name is None:
-                return _error("Model not found", 404)
-            return JSONResponse(model_info(model_id, display_name))
-        return await forward_json(request, f"/models/{model_id}")
+        return await _retrieve_model(
+            request,
+            model_id,
+            configured,
+            forward_json,
+            upstream_error,
+        )
 
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(request: Request) -> Response:
@@ -368,7 +469,11 @@ def create_app(
             headers=headers,
         )
 
-    async def forward_json(request: Request, path: str) -> Response:
+    async def forward_json(
+        request: Request,
+        path: str,
+        base_url: str | None = None,
+    ) -> Response:
         body = await _read_request_body(request, configured.max_request_body_bytes)
         headers = upstream_headers(request.headers, configured, json_body=False)
         forwarded_query = [
@@ -379,7 +484,11 @@ def create_app(
         forwarded_query.extend(configured.upstream_query.items())
         outbound = request.app.state.client.build_request(
             request.method,
-            configured.upstream_url(path),
+            (
+                f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+                if base_url
+                else configured.upstream_url(path)
+            ),
             headers=headers,
             params=forwarded_query,
             content=body,

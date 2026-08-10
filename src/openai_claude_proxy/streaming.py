@@ -640,6 +640,11 @@ def _record_responses_refusal_delta(
         refusal_parts.append(delta)
 
 
+def _require_open_responses_block(index: int, open_blocks: set[int]) -> None:
+    if index not in open_blocks:
+        raise ConversionError("Responses delta arrived after content completed")
+
+
 def _responses_function_argument_suffix(
     arguments: object,
     emitted_parts: list[str],
@@ -707,7 +712,11 @@ def _responses_text_done_events(
         raise ConversionError("Upstream finalized text does not match streamed deltas")
 
     index = block_indices.get(("text", output_index, content_index))
-    if index is None or index not in open_blocks:
+    if index is None:
+        return b""
+    if index not in open_blocks:
+        if complete != emitted:
+            raise ConversionError("Upstream finalized text changed after it was completed")
         return b""
     suffix = complete[len(emitted) :]
     events: list[bytes] = []
@@ -733,6 +742,30 @@ def _responses_text_done_events(
         ),
     )
     return b"".join(events)
+
+
+def _responses_message_content(
+    item: dict[str, Any],
+) -> list[tuple[int, str, str]]:
+    content = item.get("content")
+    if content is None:
+        return []
+    if not isinstance(content, list) or not all(isinstance(part, dict) for part in content):
+        raise ConversionError("Responses message content must be an array of objects")
+
+    completed: list[tuple[int, str, str]] = []
+    for content_index, part in enumerate(content):
+        part_type = part.get("type")
+        if part_type == "output_text":
+            text = part.get("text")
+        elif part_type == "refusal":
+            text = part.get("refusal")
+        else:
+            raise ConversionError("Unsupported Responses message content in stream")
+        if not isinstance(text, str):
+            raise ConversionError("Responses finalized message content must be text")
+        completed.append((content_index, part_type, text))
+    return completed
 
 
 def _responses_output_item_done_events(
@@ -769,15 +802,21 @@ def _responses_output_item_done_events(
         raise ConversionError("Unsupported Responses output item in stream")
 
     output_index = int(event.get("output_index", 0))
+    parts = argument_parts.setdefault(output_index, [])
     suffix = _responses_function_argument_suffix(
         item.get("arguments"),
-        argument_parts.get(output_index, []),
+        parts,
     )
     index = block_indices.get(("tool", output_index, 0))
-    if index is None or index not in open_blocks:
+    if index is None:
+        return b"", next_index
+    if index not in open_blocks:
+        if suffix:
+            raise ConversionError("Upstream finalized function arguments changed after completion")
         return b"", next_index
     events: list[bytes] = []
     if suffix:
+        parts.append(suffix)
         events.append(
             sse(
                 "content_block_delta",
@@ -870,6 +909,160 @@ def _responses_terminal_events(
     return b"".join(events), next_index
 
 
+@dataclass(slots=True)
+class _ResponsesStreamState:
+    requested_model: str
+    upstream_model: str | None
+    message_id: str = "msg_proxy"
+    started: bool = False
+    next_content_index: int = 0
+    block_indices: dict[tuple[str, int, int], int] = field(default_factory=dict)
+    open_blocks: set[int] = field(default_factory=set)
+    tool_items: dict[int, dict[str, Any]] = field(default_factory=dict)
+    tool_argument_parts: dict[int, list[str]] = field(default_factory=dict)
+    text_parts: dict[tuple[int, int], list[str]] = field(default_factory=dict)
+    has_tool_call: bool = False
+    has_refusal: bool = False
+    refusal_parts: list[str] = field(default_factory=list)
+
+    def ensure_started(self) -> bytes:
+        if self.started:
+            return b""
+        self.started = True
+        return _responses_message_start(self.message_id, self.requested_model)
+
+    def start_text(self, output_index: int, content_index: int) -> bytes:
+        key = ("text", output_index, content_index)
+        if key in self.block_indices:
+            return b""
+        index = self.next_content_index
+        self.next_content_index += 1
+        self.block_indices[key] = index
+        self.open_blocks.add(index)
+        return sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+
+    def start_tool(self, output_index: int) -> bytes:
+        key = ("tool", output_index, 0)
+        if key in self.block_indices:
+            return b""
+        index = self.next_content_index
+        self.next_content_index += 1
+        self.block_indices[key] = index
+        tool = self.tool_items.get(output_index, {})
+        self.open_blocks.add(index)
+        return sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool.get("call_id") or tool.get("id", ""),
+                    "name": tool.get("name", ""),
+                    "input": {},
+                },
+            },
+        )
+
+    def reconcile_message_item(self, item: dict[str, Any], output_index: int) -> bytes:
+        events: list[bytes] = []
+        for content_index, part_type, complete in _responses_message_content(item):
+            is_refusal = part_type == "refusal"
+            self.has_refusal = self.has_refusal or is_refusal
+            events.append(self.start_text(output_index, content_index))
+            done_event: dict[str, Any] = {
+                "type": "response.refusal.done" if is_refusal else "response.output_text.done",
+                "output_index": output_index,
+                "content_index": content_index,
+                "refusal" if is_refusal else "text": complete,
+            }
+            events.append(
+                _responses_text_done_events(
+                    done_event,
+                    self.block_indices,
+                    self.open_blocks,
+                    self.text_parts,
+                    self.refusal_parts,
+                ),
+            )
+        return b"".join(events)
+
+    def reconcile_output_item(self, event: dict[str, Any]) -> bytes:
+        item = event["item"]
+        if item.get("type") == "message":
+            return self.reconcile_message_item(item, int(event.get("output_index", 0)))
+        events, self.next_content_index = _responses_output_item_done_events(
+            event,
+            self.next_content_index,
+            self.block_indices,
+            self.open_blocks,
+            self.tool_argument_parts,
+        )
+        return events
+
+    def reconcile_terminal_output(self, output: object) -> bytes:
+        if not isinstance(output, list):
+            return b""
+        events: list[bytes] = []
+        for output_index, item in enumerate(output):
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "message":
+                events.append(self.reconcile_message_item(item, output_index))
+            elif item_type == "function_call":
+                self.tool_items[output_index] = item
+                self.has_tool_call = True
+                events.append(self.start_tool(output_index))
+                events.append(
+                    self.reconcile_output_item(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": output_index,
+                            "item": item,
+                        },
+                    ),
+                )
+        return b"".join(events)
+
+    def has_visible_output(self) -> bool:
+        return self.has_tool_call or any("".join(parts) for parts in self.text_parts.values())
+
+    def finish(self, terminal: dict[str, Any], event_type: str) -> bytes:
+        events = [self.reconcile_terminal_output(terminal.get("output"))]
+        if event_type == "response.completed" and not self.has_visible_output():
+            raise ConversionError(
+                "Responses API completed without assistant text or a function call",
+            )
+        events.extend(
+            sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": index},
+            )
+            for index in sorted(self.open_blocks)
+        )
+        self.open_blocks.clear()
+        terminal_events, self.next_content_index = _responses_terminal_events(
+            terminal,
+            self.next_content_index,
+            _ResponsesTerminalContext(
+                has_tool_call=self.has_tool_call,
+                has_refusal=self.has_refusal,
+                refusal_text="".join(self.refusal_parts),
+                upstream_model=self.upstream_model,
+            ),
+        )
+        events.append(terminal_events)
+        return b"".join(events)
+
+
 async def responses_stream_to_anthropic(
     response: httpx.Response,
     requested_model: str,
@@ -877,66 +1070,11 @@ async def responses_stream_to_anthropic(
     request_payload: dict[str, Any] | None = None,
 ) -> AsyncIterator[bytes]:
     """Translate typed OpenAI Responses events into Anthropic event order."""
-    message_id = "msg_proxy"
-    started = False
-    next_content_index = 0
-    block_indices: dict[tuple[str, int, int], int] = {}
-    open_blocks: set[int] = set()
-    tool_items: dict[int, dict[str, Any]] = {}
-    tool_argument_parts: dict[int, list[str]] = {}
-    text_parts: dict[tuple[int, int], list[str]] = {}
-    has_tool_call = False
-    has_refusal = False
-    refusal_parts: list[str] = []
-    upstream_model = (request_payload or {}).get("model")
-
-    async def ensure_started() -> AsyncIterator[bytes]:
-        nonlocal started
-        if not started:
-            started = True
-            yield _responses_message_start(message_id, requested_model)
-
-    async def start_text(output_index: int, content_index: int) -> AsyncIterator[bytes]:
-        nonlocal next_content_index
-        key = ("text", output_index, content_index)
-        if key not in block_indices:
-            block_indices[key] = next_content_index
-            next_content_index += 1
-        index = block_indices[key]
-        if index not in open_blocks:
-            open_blocks.add(index)
-            yield sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            )
-
-    async def start_tool(output_index: int) -> AsyncIterator[bytes]:
-        nonlocal next_content_index
-        key = ("tool", output_index, 0)
-        if key not in block_indices:
-            block_indices[key] = next_content_index
-            next_content_index += 1
-        index = block_indices[key]
-        if index not in open_blocks:
-            tool = tool_items.get(output_index, {})
-            open_blocks.add(index)
-            yield sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": tool.get("call_id") or tool.get("id", ""),
-                        "name": tool.get("name", ""),
-                        "input": {},
-                    },
-                },
-            )
+    raw_upstream_model = (request_payload or {}).get("model")
+    state = _ResponsesStreamState(
+        requested_model,
+        raw_upstream_model if isinstance(raw_upstream_model, str) else None,
+    )
 
     try:
         async for raw_data in iter_sse_data(response, ping_interval):
@@ -947,32 +1085,28 @@ async def responses_stream_to_anthropic(
             event_type = _validate_responses_stream_event(event)
             if event_type == "response.created":
                 created = event["response"]
-                message_id = created.get("id") or message_id
-                async for encoded in ensure_started():
-                    yield encoded
+                state.message_id = created.get("id") or state.message_id
+                yield state.ensure_started()
             elif event_type == "response.output_item.added":
                 item = event["item"]
                 if item.get("type") == "function_call":
                     output_index = int(event.get("output_index", 0))
-                    tool_items[output_index] = item
-                    has_tool_call = True
-                    async for encoded in ensure_started():
-                        yield encoded
-                    async for encoded in start_tool(output_index):
-                        yield encoded
+                    state.tool_items[output_index] = item
+                    state.has_tool_call = True
+                    yield state.ensure_started()
+                    yield state.start_tool(output_index)
             elif event_type in {"response.output_text.delta", "response.refusal.delta"}:
-                has_refusal = has_refusal or event_type == "response.refusal.delta"
+                state.has_refusal = state.has_refusal or event_type == "response.refusal.delta"
                 output_index = int(event.get("output_index", 0))
                 content_index = int(event.get("content_index", 0))
-                async for encoded in ensure_started():
-                    yield encoded
-                async for encoded in start_text(output_index, content_index):
-                    yield encoded
-                index = block_indices[("text", output_index, content_index)]
+                yield state.ensure_started()
+                yield state.start_text(output_index, content_index)
+                index = state.block_indices[("text", output_index, content_index)]
+                _require_open_responses_block(index, state.open_blocks)
                 delta = event["delta"]
-                _record_responses_refusal_delta(event_type, delta, refusal_parts)
+                _record_responses_refusal_delta(event_type, delta, state.refusal_parts)
                 if delta:
-                    text_parts.setdefault((output_index, content_index), []).append(delta)
+                    state.text_parts.setdefault((output_index, content_index), []).append(delta)
                     yield sse(
                         "content_block_delta",
                         {
@@ -986,16 +1120,14 @@ async def responses_stream_to_anthropic(
                 "response.function_call_arguments.done",
             }:
                 output_index = int(event.get("output_index", 0))
-                async for encoded in ensure_started():
-                    yield encoded
-                async for encoded in start_tool(output_index):
-                    yield encoded
-                index = block_indices[("tool", output_index, 0)]
+                yield state.ensure_started()
+                yield state.start_tool(output_index)
+                index = state.block_indices[("tool", output_index, 0)]
                 argument_events = _responses_argument_event(
                     event,
                     index,
                     output_index,
-                    tool_argument_parts,
+                    state.tool_argument_parts,
                 )
                 yield argument_events
             elif event_type in {
@@ -1005,51 +1137,24 @@ async def responses_stream_to_anthropic(
             }:
                 output_index = int(event.get("output_index", 0))
                 content_index = int(event.get("content_index", 0))
-                async for encoded in ensure_started():
-                    yield encoded
-                async for encoded in start_text(output_index, content_index):
-                    yield encoded
+                yield state.ensure_started()
+                yield state.start_text(output_index, content_index)
                 done_events = _responses_text_done_events(
                     event,
-                    block_indices,
-                    open_blocks,
-                    text_parts,
-                    refusal_parts,
+                    state.block_indices,
+                    state.open_blocks,
+                    state.text_parts,
+                    state.refusal_parts,
                 )
                 yield done_events
             elif event_type == "response.output_item.done":
-                async for encoded in ensure_started():
-                    yield encoded
-                done_events, next_content_index = _responses_output_item_done_events(
-                    event,
-                    next_content_index,
-                    block_indices,
-                    open_blocks,
-                    tool_argument_parts,
-                )
-                yield done_events
+                yield state.ensure_started()
+                yield state.reconcile_output_item(event)
             elif event_type in {"response.completed", "response.incomplete"}:
                 terminal = event["response"]
-                message_id = terminal.get("id") or message_id
-                async for encoded in ensure_started():
-                    yield encoded
-                for index in sorted(open_blocks):
-                    yield sse(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": index},
-                    )
-                open_blocks.clear()
-                terminal_events, next_content_index = _responses_terminal_events(
-                    terminal,
-                    next_content_index,
-                    _ResponsesTerminalContext(
-                        has_tool_call=has_tool_call,
-                        has_refusal=has_refusal,
-                        refusal_text="".join(refusal_parts),
-                        upstream_model=upstream_model,
-                    ),
-                )
-                yield terminal_events
+                state.message_id = terminal.get("id") or state.message_id
+                yield state.ensure_started()
+                yield state.finish(terminal, event_type)
                 return
             elif event_type in {"error", "response.failed"}:
                 yield _responses_error_event(event)
